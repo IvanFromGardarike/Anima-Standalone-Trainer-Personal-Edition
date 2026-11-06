@@ -4,6 +4,7 @@
 - `training-ui/server.js`
 - `training-ui/public/index.html`
 - `training-ui/public/js/app.js`
+- `networks/lora_anima.py` (раздел 6)
 
 Это личный форк. Upstream, на котором основан патч, — коммит `7f5c336`; все правки — отдельные коммиты поверх него.
 Обновиться с upstream: добавить его как remote `upstream`, затем `git fetch upstream` → `git merge upstream/main`.
@@ -38,3 +39,12 @@
 - Галочки «оставить» у чекпоинтов (по умолчанию финальный и последний шаг), удаление старых `-stepNNN-state`.
 - Последний `-state` не удаляется без отдельной галочки (иначе не будет Auto-resume).
 - Удаление только после подтверждения со списком файлов; во время обучения запрещено.
+
+## 6. LoKr / LoHa / DoRA (вкладка Network → Advanced → Network Type)
+- Network Type: LoRA (как раньше), LoKr, LoHa (оба LyCORIS-совместимые) или DoRA. Пишется в `network_args` как `algo=lokr|loha|dora`, для LoKr ещё `factor=N`.
+- LoKr — персонаж в одном стиле (меньше тащит стиль), LR обычно выше, чем у LoRA. Factor 8–16 или -1 = авто; очень большой Network Dim (например 100000) = полные матрицы.
+- LoHa — стили художников (больше мелких деталей при том же dim), dim 8–16, перегорает легче.
+- DoRA — LoRA + обучаемая «сила» правки (`dora_scale`), точнее держит персонажа, обучение медленнее.
+- Ключи стандартные (LoKr: `lokr_w1`, `lokr_w2`/`lokr_w2_a`+`lokr_w2_b`; LoHa: `hada_w1_a/b`, `hada_w2_a/b`; DoRA: `lora_down/up` + `dora_scale`): ComfyUI / SwarmUI грузят без плагинов, AnimaMerger тоже (DoRA — с моделью, во вкладке «Вшить LoRA»).
+- LoRA+ работает только с LoRA и DoRA, Rank Dropout — только с LoRA. Только обычное обучение на одной видеокарте (не TP/SP).
+- Test Generation в интерфейсе понимает все эти файлы.

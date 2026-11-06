@@ -587,6 +587,8 @@ function populateConfig(config) {
     $("cfg-lx-rank-dropout").value = kv.rank_dropout ?? "";
     $("cfg-lx-module-dropout").value = kv.module_dropout ?? "";
     $("cfg-lx-llm-adapter").checked = String(kv.train_llm_adapter ?? "") === "True";
+    { const al = (kv.algo ?? "").toLowerCase(); $("cfg-lx-algo").value = ["lokr", "loha", "dora"].includes(al) ? al : ""; }
+    $("cfg-lx-factor").value = kv.factor ?? "";
     $("cfg-network-args").value = rest.join(" ");
   }
   $("cfg-fp8-base").checked = t.fp8_base ?? false; // [AniDream patch]
@@ -1015,7 +1017,8 @@ $("cfg-dit-override").addEventListener("input", updateDitOverrideHint);
 loadDitModels();
 // [AniDream patch]
 const LX_KEYS = ["train_block_indices", "self_attn_dim", "cross_attn_dim", "mlp_dim", "mod_dim",
-  "loraplus_lr_ratio", "loraplus_unet_lr_ratio", "rank_dropout", "module_dropout", "train_llm_adapter"];
+  "loraplus_lr_ratio", "loraplus_unet_lr_ratio", "rank_dropout", "module_dropout", "train_llm_adapter",
+  "algo", "factor"];
 function gatherNetworkArgs() {
   const out = [];
   const add = (k, v) => { if (v !== "" && v !== null && v !== undefined) out.push(`${k}=${v}`); };
@@ -1032,6 +1035,9 @@ function gatherNetworkArgs() {
   const md = $("cfg-lx-module-dropout").value.trim();
   if (md && Number(md) > 0) add("module_dropout", md);
   if ($("cfg-lx-llm-adapter").checked) add("train_llm_adapter", "True");
+  const algo = $("cfg-lx-algo").value;
+  if (algo) add("algo", algo);
+  if (algo === "lokr") add("factor", $("cfg-lx-factor").value.trim());
   const setKeys = new Set(out.map((s) => s.split("=")[0]));
   for (const tok of $("cfg-network-args").value.trim().split(/\s+/).filter(Boolean)) {
     const k = tok.split("=")[0];

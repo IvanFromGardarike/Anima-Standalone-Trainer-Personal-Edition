@@ -517,6 +517,348 @@ def _select_lora_class(child_module, tp_group=None, use_sp=False, seq_dim=1):
         return None, {}  # use the default module_class
 
 
+# ---------------------------------------------------------------------------
+#  [AniDream patch] LoKr (LyCORIS-compatible Kronecker adapter)
+#  Enabled with network_args: algo=lokr factor=8 (dim/alpha as usual).
+#  Weights are saved with standard LyCORIS keys (lokr_w1, lokr_w2 or
+#  lokr_w2_a/lokr_w2_b, alpha), which ComfyUI / SwarmUI load natively.
+#  Single-GPU path only (no Tensor/Sequence Parallel).
+# ---------------------------------------------------------------------------
+
+def lokr_factorization(dimension: int, factor: int = -1) -> Tuple[int, int]:
+    """Same split as LyCORIS: returns (m, n), m <= n, m * n == dimension."""
+    if factor > 0 and (dimension % factor) == 0:
+        m, n = factor, dimension // factor
+        if m > n:
+            n, m = m, n
+        return m, n
+    if factor < 0:
+        factor = dimension
+    m, n = 1, dimension
+    length = m + n
+    while m < n:
+        new_m = m + 1
+        while dimension % new_m != 0:
+            new_m += 1
+        new_n = dimension // new_m
+        if new_m + new_n > length or new_m > factor:
+            break
+        m, n = new_m, new_n
+    if m > n:
+        n, m = m, n
+    return m, n
+
+
+class LoKrModule(torch.nn.Module):
+    """delta_W = kron(w1, w2) * scale, w2 = w2_a @ w2_b when rank is small enough.
+
+    forward never builds the full delta matrix: kron(A, B) @ x is computed as
+    A @ X @ B^T on x reshaped to (in_m, in_n), so memory stays at activation size.
+    """
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=None,
+        rank_dropout=None,
+        module_dropout=None,
+        factor: int = -1,
+        **kwargs,
+    ):
+        super().__init__()
+        self.lora_name = lora_name
+        in_dim = org_module.in_features
+        out_dim = org_module.out_features
+        self.in_m, self.in_n = lokr_factorization(in_dim, factor)
+        self.out_m, self.out_n = lokr_factorization(out_dim, factor)
+        self.lora_dim = int(lora_dim)
+
+        # w1 is always a small full matrix (out_m x in_m)
+        self.lokr_w1 = torch.nn.Parameter(torch.empty(self.out_m, self.in_m))
+        torch.nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
+
+        self.use_w2 = self.lora_dim >= max(self.out_n, self.in_n) / 2
+        if self.use_w2:
+            self.lokr_w2 = torch.nn.Parameter(torch.zeros(self.out_n, self.in_n))
+        else:
+            self.lokr_w2_a = torch.nn.Parameter(torch.empty(self.out_n, self.lora_dim))
+            self.lokr_w2_b = torch.nn.Parameter(torch.zeros(self.lora_dim, self.in_n))
+            torch.nn.init.kaiming_uniform_(self.lokr_w2_a, a=math.sqrt(5))
+
+        if type(alpha) == torch.Tensor:
+            alpha = alpha.detach().float().numpy()
+        alpha = self.lora_dim if alpha is None or alpha == 0 else float(alpha)
+        if self.use_w2:
+            alpha = self.lora_dim  # full matrices: no scaling (same as LyCORIS / ComfyUI)
+        self.scale = alpha / self.lora_dim
+        self.register_buffer("alpha", torch.tensor(alpha))
+
+        self.multiplier = multiplier
+        self.org_module = org_module
+        self.org_module_ref = [org_module]
+        self.dropout = dropout
+        self.rank_dropout = rank_dropout
+        self.module_dropout = module_dropout
+        self.enabled = True
+
+    def apply_to(self):
+        self.org_forward = self.org_module.forward
+        self.org_module.forward = self.forward
+        del self.org_module
+
+    def _w2(self) -> torch.Tensor:
+        if self.use_w2:
+            return self.lokr_w2
+        return self.lokr_w2_a @ self.lokr_w2_b
+
+    def _delta_x(self, x: torch.Tensor) -> torch.Tensor:
+        dt = x.dtype
+        w1 = self.lokr_w1.to(dt)
+        lead = x.shape[:-1]
+        xr = x.reshape(-1, self.in_m, self.in_n)
+        if self.use_w2:
+            t = xr @ self.lokr_w2.to(dt).t()  # (N, in_m, out_n)
+        else:
+            t = (xr @ self.lokr_w2_b.to(dt).t()) @ self.lokr_w2_a.to(dt).t()
+        y = torch.einsum("oi,bin->bon", w1, t)  # (N, out_m, out_n)
+        return y.reshape(*lead, self.out_m * self.out_n)
+
+    def forward(self, x):
+        org_forwarded = self.org_forward(x)
+        if not self.enabled:
+            return org_forwarded
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1) < self.module_dropout:
+                return org_forwarded
+        dx = self._delta_x(x)
+        if self.dropout is not None and self.training:
+            dx = torch.nn.functional.dropout(dx, p=self.dropout)
+        return org_forwarded + dx * (self.multiplier * self.scale)
+
+    def get_weight(self, multiplier=None):
+        if multiplier is None:
+            multiplier = self.multiplier
+        w = torch.kron(self.lokr_w1.float(), self._w2().float())
+        return w * (multiplier * self.scale)
+
+    @torch.no_grad()
+    def merge_to(self, sd, dtype, device):
+        org_sd = self.org_module.state_dict()
+        weight = org_sd["weight"]
+        org_dtype = weight.dtype
+        dev = weight.device
+        if dtype is None:
+            dtype = org_dtype
+        w1 = sd["lokr_w1"].float().to(dev)
+        if "lokr_w2" in sd:
+            w2 = sd["lokr_w2"].float().to(dev)
+            scale = 1.0
+        else:
+            w2_a = sd["lokr_w2_a"].float().to(dev)
+            w2_b = sd["lokr_w2_b"].float().to(dev)
+            w2 = w2_a @ w2_b
+            alpha = float(sd["alpha"]) if "alpha" in sd else float(w2_b.shape[0])
+            scale = alpha / w2_b.shape[0]
+        delta = torch.kron(w1, w2) * scale
+        org_sd["weight"] = (weight.float() + self.multiplier * delta).to(dtype)
+        self.org_module.load_state_dict(org_sd)
+
+
+def _make_lokr_class(factor: int):
+    """Constructor used by LoRANetwork: LoKr for Linear, plain LoRA for anything else (e.g. Conv2d)."""
+
+    def build(lora_name, org_module, multiplier, lora_dim, alpha, **kw):
+        if org_module.__class__.__name__ == "Linear":
+            return LoKrModule(lora_name, org_module, multiplier, lora_dim, alpha, factor=factor, **kw)
+        return LoRAModule(lora_name, org_module, multiplier, lora_dim, alpha, **kw)
+
+    return build
+
+
+# ---------------------------------------------------------------------------
+#  [AniDream patch] LoHa (LyCORIS-compatible) and DoRA
+#  network_args: algo=loha  /  algo=dora   (dim/alpha as usual)
+#  LoHa keys: hada_w1_a, hada_w1_b, hada_w2_a, hada_w2_b, alpha
+#  DoRA keys: lora_down.weight, lora_up.weight, alpha, dora_scale (1, in_dim)
+#  Both load in ComfyUI / SwarmUI without plugins.
+# ---------------------------------------------------------------------------
+
+class _HadaWeight(torch.autograd.Function):
+    """(w1a @ w1b) * (w2a @ w2b) * scale without keeping the two full products for backward."""
+
+    @staticmethod
+    def forward(ctx, w1a, w1b, w2a, w2b, scale):
+        ctx.save_for_backward(w1a, w1b, w2a, w2b)
+        ctx.scale = scale
+        return (w1a @ w1b) * (w2a @ w2b) * scale
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        w1a, w1b, w2a, w2b = ctx.saved_tensors
+        grad_out = grad_out * ctx.scale
+        temp = grad_out * (w2a @ w2b)
+        grad_w1a = temp @ w1b.T
+        grad_w1b = w1a.T @ temp
+        temp = grad_out * (w1a @ w1b)
+        grad_w2a = temp @ w2b.T
+        grad_w2b = w2a.T @ temp
+        return grad_w1a, grad_w1b, grad_w2a, grad_w2b, None
+
+
+class LoHaModule(torch.nn.Module):
+    def __init__(self, lora_name, org_module, multiplier=1.0, lora_dim=4, alpha=1,
+                 dropout=None, rank_dropout=None, module_dropout=None, **kwargs):
+        super().__init__()
+        self.lora_name = lora_name
+        in_dim, out_dim = org_module.in_features, org_module.out_features
+        self.lora_dim = int(lora_dim)
+        r = self.lora_dim
+        self.hada_w1_a = torch.nn.Parameter(torch.empty(out_dim, r))
+        self.hada_w1_b = torch.nn.Parameter(torch.empty(r, in_dim))
+        self.hada_w2_a = torch.nn.Parameter(torch.empty(out_dim, r))
+        self.hada_w2_b = torch.nn.Parameter(torch.empty(r, in_dim))
+        # same init as LyCORIS: one product starts at zero
+        torch.nn.init.normal_(self.hada_w1_b, std=1)
+        torch.nn.init.normal_(self.hada_w1_a, std=0.1)
+        torch.nn.init.normal_(self.hada_w2_b, std=1)
+        torch.nn.init.constant_(self.hada_w2_a, 0)
+        if type(alpha) == torch.Tensor:
+            alpha = alpha.detach().float().numpy()
+        alpha = r if alpha is None or alpha == 0 else float(alpha)
+        self.scale = alpha / r
+        self.register_buffer("alpha", torch.tensor(alpha))
+        self.multiplier = multiplier
+        self.org_module = org_module
+        self.org_module_ref = [org_module]
+        self.dropout = dropout
+        self.module_dropout = module_dropout
+        self.enabled = True
+
+    def apply_to(self):
+        self.org_forward = self.org_module.forward
+        self.org_module.forward = self.forward
+        del self.org_module
+
+    def get_weight(self, multiplier=None):
+        if multiplier is None:
+            multiplier = self.multiplier
+        w = (self.hada_w1_a.float() @ self.hada_w1_b.float()) * (self.hada_w2_a.float() @ self.hada_w2_b.float())
+        return w * (self.scale * multiplier)
+
+    def forward(self, x):
+        org_forwarded = self.org_forward(x)
+        if not self.enabled:
+            return org_forwarded
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1) < self.module_dropout:
+                return org_forwarded
+        dt = x.dtype
+        w = _HadaWeight.apply(self.hada_w1_a.to(dt), self.hada_w1_b.to(dt),
+                              self.hada_w2_a.to(dt), self.hada_w2_b.to(dt), self.scale)
+        dx = torch.nn.functional.linear(x, w)
+        if self.dropout is not None and self.training:
+            dx = torch.nn.functional.dropout(dx, p=self.dropout)
+        return org_forwarded + dx * self.multiplier
+
+    @torch.no_grad()
+    def merge_to(self, sd, dtype, device):
+        org_sd = self.org_module.state_dict()
+        weight = org_sd["weight"]
+        dev = weight.device
+        if dtype is None:
+            dtype = weight.dtype
+        T = lambda k: sd[k].float().to(dev)
+        r = sd["hada_w1_b"].shape[0]
+        alpha = float(sd["alpha"]) if "alpha" in sd else float(r)
+        delta = (T("hada_w1_a") @ T("hada_w1_b")) * (T("hada_w2_a") @ T("hada_w2_b")) * (alpha / r)
+        org_sd["weight"] = (weight.float() + self.multiplier * delta).to(dtype)
+        self.org_module.load_state_dict(org_sd)
+
+
+class DoRAModule(LoRAModule):
+    """LoRA + learned magnitude: W' = dora_scale * (W + s*B@A) / ||W + s*B@A||, norm per input column
+    (DoRA paper / LyCORIS default; the norm is treated as a constant for backward, as the paper suggests).
+    multiplier != 1 blends like ComfyUI: W + m * (W' - W)."""
+
+    def __init__(self, lora_name, org_module, multiplier=1.0, lora_dim=4, alpha=1,
+                 dropout=None, rank_dropout=None, module_dropout=None, **kwargs):
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha,
+                         dropout=dropout, rank_dropout=rank_dropout, module_dropout=module_dropout)
+        with torch.no_grad():
+            w = org_module.weight.detach().float()
+            self.dora_scale = torch.nn.Parameter(w.norm(dim=0, keepdim=True))  # (1, in_dim)
+        self.org_module_ref = [org_module]
+        self.enabled = True
+
+    def _dora_weight(self, x_dtype):
+        org = self.org_module_ref[0]
+        w = org.weight.detach().to(x_dtype)
+        up, down = self.lora_up.weight.to(x_dtype), self.lora_down.weight.to(x_dtype)
+        merged = w + (up @ down) * self.scale
+        norm = merged.detach().float().norm(dim=0, keepdim=True) + torch.finfo(torch.float32).eps
+        wn = merged * (self.dora_scale.float() / norm).to(x_dtype)
+        if self.multiplier != 1.0:
+            wn = w + (wn - w) * self.multiplier
+        return wn
+
+    def forward(self, x):
+        if not getattr(self, "enabled", True):
+            return self.org_forward(x)
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1) < self.module_dropout:
+                return self.org_forward(x)
+        org = self.org_module_ref[0]
+        bias = org.bias.to(x.dtype) if org.bias is not None else None
+        return torch.nn.functional.linear(x, self._dora_weight(x.dtype), bias)
+
+    def get_weight(self, multiplier=None):
+        org = self.org_module_ref[0]
+        w = org.weight.detach().float()
+        old = self.multiplier
+        self.multiplier = self.multiplier if multiplier is None else multiplier
+        wn = self._dora_weight(torch.float32)
+        self.multiplier = old
+        return wn - w
+
+    @torch.no_grad()
+    def merge_to(self, sd, dtype, device):
+        org_sd = self.org_module.state_dict()
+        weight = org_sd["weight"]
+        dev = weight.device
+        if dtype is None:
+            dtype = weight.dtype
+        down = sd["lora_down.weight"].float().to(dev)
+        up = sd["lora_up.weight"].float().to(dev)
+        r = down.shape[0]
+        alpha = float(sd["alpha"]) if "alpha" in sd else float(r)
+        w = weight.float()
+        wc = w + (up @ down) * (alpha / r)
+        m = sd["dora_scale"].float().to(dev)
+        if m.shape[0] == wc.shape[0] and m.shape != (1, wc.shape[1]):
+            norm = w.norm(dim=1, keepdim=True)          # per-output DoRA (ComfyUI convention)
+        else:
+            norm = wc.norm(dim=0, keepdim=True)
+            m = m.reshape(1, -1)
+        wn = wc * (m / (norm + torch.finfo(torch.float32).eps))
+        org_sd["weight"] = (w + self.multiplier * (wn - w)).to(dtype)
+        self.org_module.load_state_dict(org_sd)
+
+
+def _make_linear_only_class(cls):
+    """Use cls for Linear layers, plain LoRA for anything else (e.g. the Conv2d patch embedder)."""
+
+    def build(lora_name, org_module, multiplier, lora_dim, alpha, **kw):
+        if org_module.__class__.__name__ == "Linear":
+            return cls(lora_name, org_module, multiplier, lora_dim, alpha, **kw)
+        return LoRAModule(lora_name, org_module, multiplier, lora_dim, alpha, **kw)
+
+    return build
+
+
 def create_network(
     multiplier: float,
     network_dim: Optional[int],
@@ -608,10 +950,30 @@ def create_network(
     if verbose is not None:
         verbose = True if verbose == "True" else False
 
+    # [AniDream patch] network type
+    algo = str(kwargs.get("algo", "lora")).lower()
+    extra = {}
+    if algo == "lokr":
+        factor = int(kwargs.get("factor", -1))
+        extra["module_class"] = _make_lokr_class(factor)
+        logger.info(f"network type: LoKr, factor={factor}")
+        if rank_dropout is not None:
+            logger.warning("rank_dropout is ignored for LoKr")
+            rank_dropout = None
+    elif algo in ("loha", "dora"):
+        extra["module_class"] = _make_linear_only_class(LoHaModule if algo == "loha" else DoRAModule)
+        logger.info(f"network type: {'LoHa' if algo == 'loha' else 'DoRA'}")
+        if rank_dropout is not None:
+            logger.warning(f"rank_dropout is ignored for {algo}")
+            rank_dropout = None
+    elif algo != "lora":
+        raise ValueError(f"unknown algo={algo}, supported: lora, lokr, loha, dora")
+
     network = LoRANetwork(
         text_encoders,
         unet,
         multiplier=multiplier,
+        **extra,
         lora_dim=network_dim,
         alpha=network_alpha,
         dropout=neuron_dropout,
@@ -630,6 +992,9 @@ def create_network(
     loraplus_lr_ratio = float(loraplus_lr_ratio) if loraplus_lr_ratio is not None else None
     loraplus_unet_lr_ratio = float(loraplus_unet_lr_ratio) if loraplus_unet_lr_ratio is not None else None
     loraplus_text_encoder_lr_ratio = float(loraplus_text_encoder_lr_ratio) if loraplus_text_encoder_lr_ratio is not None else None
+    if algo in ("lokr", "loha") and (loraplus_lr_ratio or loraplus_unet_lr_ratio or loraplus_text_encoder_lr_ratio):
+        logger.warning(f"LoRA+ is not used with {algo} (no up/down matrices)")  # [AniDream patch]
+        loraplus_lr_ratio = loraplus_unet_lr_ratio = loraplus_text_encoder_lr_ratio = None
     if loraplus_lr_ratio is not None or loraplus_unet_lr_ratio is not None or loraplus_text_encoder_lr_ratio is not None:
         network.set_loraplus_lr_ratio(loraplus_lr_ratio, loraplus_unet_lr_ratio, loraplus_text_encoder_lr_ratio)
 
@@ -657,6 +1022,12 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
         elif "lora_down" in key:
             dim = value.size()[0]
             modules_dim[lora_name] = dim
+        elif key.endswith(".hada_w1_b"):  # [AniDream patch] LoHa
+            modules_dim[lora_name] = value.size()[0]
+        elif key.endswith(".lokr_w2_b"):  # [AniDream patch] LoKr
+            modules_dim[lora_name] = value.size()[0]
+        elif key.endswith(".lokr_w2"):
+            modules_dim[lora_name] = max(value.size())  # full w2
 
         if "llm_adapter" in lora_name:
             train_llm_adapter = True
@@ -676,6 +1047,20 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, unet, weigh
                 modules_alpha.setdefault(packed_name, modules_alpha[lora_name])
 
     module_class = LoRAInfModule if for_inference else LoRAModule
+    if any(k.endswith(".hada_w1_a") for k in weights_sd.keys()):  # [AniDream patch]
+        if any(k.endswith(".hada_t1") for k in weights_sd.keys()):
+            raise ValueError("LoHa with tucker is not supported")
+        module_class = _make_linear_only_class(LoHaModule)
+    elif any(k.endswith(".dora_scale") for k in weights_sd.keys()):  # [AniDream patch]
+        module_class = _make_linear_only_class(DoRAModule)
+    elif any(k.endswith(".lokr_w1") for k in weights_sd.keys()):  # [AniDream patch]
+        if any(k.endswith(".lokr_w1_a") or k.endswith(".lokr_t2") for k in weights_sd.keys()):
+            raise ValueError("this LoKr uses decomposed w1 / tucker, not supported")
+        for k, v in weights_sd.items():
+            if k.endswith(".lokr_w1"):
+                modules_alpha.setdefault(k[: -len(".lokr_w1")], torch.tensor(float(modules_dim.get(k[: -len(".lokr_w1")], 1))))
+        # factor only shapes the trainable params; merge_to() reads the real tensors from the file
+        module_class = _make_lokr_class(-1)
 
     network = LoRANetwork(
         text_encoders,
@@ -1344,4 +1729,6 @@ class LoRANetwork(torch.nn.Module):
             scalednorm = updown.norm() * ratio
             norms.append(scalednorm.item())
 
+        if not norms:  # [AniDream patch] LoKr has no lora_down/lora_up
+            return 0, 0.0, 0.0
         return keys_scaled, sum(norms) / len(norms), max(norms)

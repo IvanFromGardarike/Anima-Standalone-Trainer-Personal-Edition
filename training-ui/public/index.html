@@ -590,6 +590,13 @@
                             </div>
                             <!-- [AniDream patch] advanced Anima LoRA options (stored as network_args) -->
                             <h4 style="margin-top:12px;">Advanced (Anima LoRA)</h4>
+                            <div class="form-row">
+                                <div class="form-group"><label>Network Type</label>
+                                    <select id="cfg-lx-algo"><option value="">LoRA</option><option value="lokr">LoKr (LyCORIS)</option><option value="loha">LoHa (LyCORIS)</option><option value="dora">DoRA</option></select>
+                                    <small>LoRA: default, for everything. LoKr: small file, picks up style less — characters drawn in one style. Usually needs a higher LR. LoHa: remembers more fine detail at the same dim — artist styles; overcooks easier, use dim 8–16. DoRA: LoRA that also learns the strength of each change — often holds characters more precisely, trains slower. LoRA+ works only with LoRA/DoRA; Rank Dropout only with LoRA.</small></div>
+                                <div class="form-group"><label>LoKr Factor (LoKr only)</label><input type="number" id="cfg-lx-factor" step="1" placeholder="-1 (auto)">
+                                    <small>Splits each layer into factor × rest. Common: 8–16 (smaller file, weaker) or -1 = auto. With a very large Network Dim (e.g. 100000) LoKr uses full matrices.</small></div>
+                            </div>
                             <div class="form-group">
                                 <label>Blocks to Train</label>
                                 <input type="text" id="cfg-lx-blocks" placeholder="all  (e.g. 14-27  or  0-7,14-27)">
