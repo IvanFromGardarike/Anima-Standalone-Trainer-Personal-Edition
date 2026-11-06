@@ -171,6 +171,30 @@ app.get('/api/models', (req, res) => {
     }
 });
 
+// [AniDream patch] count images (and captions) in dataset folders for the steps calculator
+app.post('/api/count-images', (req, res) => {
+    const IMG = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.jxl', '.avif']);
+    const out = [];
+    for (const raw of (req.body?.dirs || [])) {
+        const dir = stripQuotes(String(raw || '')).trim();
+        const r = { dir, images: 0, captions: 0, error: null };
+        if (!dir) { r.error = 'empty path'; out.push(r); continue; }
+        try {
+            const names = fs.readdirSync(dir);
+            const lower = new Set(names.map((n) => n.toLowerCase()));
+            for (const n of names) {
+                const ext = path.extname(n).toLowerCase();
+                if (!IMG.has(ext)) continue;
+                r.images++;
+                const stem = n.slice(0, n.length - ext.length).toLowerCase();
+                if (lower.has(stem + '.txt') || lower.has(stem + '.caption')) r.captions++;
+            }
+        } catch (e) { r.error = e.code === 'ENOENT' ? 'folder not found' : e.message; }
+        out.push(r);
+    }
+    res.json({ results: out });
+});
+
 app.get('/api/gpu/activity', (req, res) => {
     const activity = {};
 

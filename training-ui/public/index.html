@@ -91,6 +91,55 @@
                 <div class="tab-content">
                     <!-- Training Tab -->
                     <div id="tab-training" class="tab-pane active">
+                        <!-- [AniDream patch] presets + steps calculator -->
+                        <h4>Preset &amp; Steps Calculator</h4>
+                        <div style="display:grid; grid-template-columns:1fr auto; gap:16px; align-items:end;">
+                            <div class="form-group">
+                                <label>What are you training?</label>
+                                <select id="ad-preset">
+                                    <option value="">— choose —</option>
+                                    <option value="style">Style (artist) — LoRA</option>
+                                    <option value="style_loha">Style, fine texture — LoHa</option>
+                                    <option value="character">Character — LoRA</option>
+                                    <option value="character_onestyle">Character, dataset in one style — LoKr</option>
+                                    <option value="character_dora">Character, precise — DoRA</option>
+                                    <option value="object">Object / weapon / outfit — LoRA</option>
+                                    <option value="concept">Concept / pose / action — LoRA</option>
+                                    <option value="toolkit">Concept toolkit (several elements) — LoRA</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="align-self:start;"><label>&nbsp;</label>
+                                <button class="btn" id="ad-preset-apply" type="button">Apply preset</button>
+                            </div>
+                        </div>
+                        <div id="ad-preset-hint" class="hint" style="display:none; margin: 4px 0 12px; padding: 10px; background: var(--bg-secondary); border-radius: 4px; border-left: 3px solid var(--accent); line-height: 1.45; white-space: pre-line;"></div>
+                        <div style="display:grid; grid-template-columns:1fr auto 1fr; gap:16px; align-items:end;">
+                            <div class="form-group">
+                                <label>Images × repeats</label>
+                                <input type="number" id="ad-images" min="1" placeholder="e.g. 60">
+                                <small id="ad-images-info">Press “Count” to read the Dataset tab folders, or type the number.</small>
+                            </div>
+                            <div class="form-group" style="align-self:start;"><label>&nbsp;</label>
+                                <button class="btn btn-ghost" id="ad-count" type="button">Count</button>
+                            </div>
+                            <div class="form-group">
+                                <label>Epochs</label>
+                                <input type="number" id="ad-epochs" min="1" step="1" value="15">
+                                <small>How many times every image is seen. Set by the preset, change freely.</small>
+                            </div>
+                        </div>
+                        <div style="display:grid; grid-template-columns:1fr auto; gap:16px; align-items:end;">
+                            <div class="form-group">
+                                <label>Recommended steps</label>
+                                <input type="text" id="ad-result" readonly placeholder="—">
+                                <small id="ad-result-info">Uses Batch Size and Gradient Accumulation from the Dataset tab.</small>
+                            </div>
+                            <div class="form-group" style="align-self:start;"><label>&nbsp;</label>
+                                <button class="btn" id="ad-fill" type="button">Fill in steps</button>
+                            </div>
+                        </div>
+                        <small style="display:block; margin-bottom:14px;">“Fill in steps” switches to Steps and writes Max Steps, Save Every and Sample Every — you can still edit them afterwards.</small>
+
                         <h4>Optimization</h4>
                         <div class="form-row">
                             <div class="form-group">

@@ -3905,3 +3905,154 @@ async function init() {
 }
 init();
 window.addEventListener("beforeunload", () => savePromptTransientSettings());
+
+// ==========================================
+//  [AniDream patch] Presets + steps calculator
+// ==========================================
+// epochs = how many times each image (× repeats) is seen; min/max clamp the step count.
+// LR values are for RAdamScheduleFree / AdamW-type optimizers (not Prodigy / DAdapt).
+const AD_PRESETS = {
+  style: {
+    algo: "", dim: 32, alpha: 16, lr: "0.0001", epochs: 15, min: 1500, max: 5000,
+    hint: "Style. Captions: trigger first, then WHAT is in the picture (who, what, where).\n" +
+      "Do NOT write style words (oil painting, brush strokes, painterly, flat colors…) — they would absorb the style instead of the LoRA.\n" +
+      "Remove watermarks / artist signatures, upscale images under ~1 MP. 100–300 images is a good size.",
+  },
+  style_loha: {
+    algo: "loha", dim: 16, alpha: 8, lr: "0.0001", epochs: 15, min: 1500, max: 5000,
+    hint: "Style with fine texture (brush strokes, grain). LoHa remembers more small detail than LoRA at the same dim, but overcooks easier:\n" +
+      "keep several checkpoints and compare. Captions — same rules as the Style preset.",
+  },
+  character: {
+    algo: "", dim: 16, alpha: 8, lr: "0.0001", epochs: 15, min: 800, max: 2500,
+    hint: "Character. Captions: trigger + everything that CHANGES between images (clothes, pose, background, expression, hairstyle if it varies).\n" +
+      "Do NOT caption permanent traits (face, eye/hair colour, ears, freckles…) — the trigger must absorb them.\n" +
+      "Variable traits (glasses, hair up/down, anatomy variants) — caption on every image where they appear, and caption the other variant too.\n" +
+      "Remove hype words (beautiful, sexy, masterpiece) from captions. 30–60 varied images are enough.",
+  },
+  character_onestyle: {
+    algo: "lokr", factor: 8, dim: 100000, alpha: 1, lr: "0.0002", epochs: 15, min: 800, max: 2500,
+    hint: "Character whose images are all in one style. LoKr picks up the style less than LoRA.\n" +
+      "Step 1: train this, take a middle checkpoint where the face is recognisable.\n" +
+      "Step 2: generate the character with it at 0.6–0.8 in many other styles (@artist tags, style LoRAs), keep the recognisable ones (30–60).\n" +
+      "Step 3: train the final LoRA on that set, with the style of each image as a tag in its caption.\n" +
+      "Captions — same rules as the Character preset. Dim 100000 = LoKr full matrices (file stays small).",
+  },
+  character_dora: {
+    algo: "dora", dim: 16, alpha: 8, lr: "0.0001", epochs: 15, min: 800, max: 2500,
+    hint: "Character with DoRA: often holds small details of the design more precisely than LoRA; trains slower.\n" +
+      "Captions — same rules as the Character preset. Note: AnimaMerger can bake a DoRA into a model, but can't mix it with other LoRAs.",
+  },
+  object: {
+    algo: "", dim: 16, alpha: 8, lr: "0.0001", epochs: 12, min: 600, max: 2000,
+    hint: "Object / weapon / outfit. Captions: trigger + who holds or wears it, angle, background — not the details of the object itself.\n" +
+      "Use different angles and owners, otherwise the LoRA learns the person together with the object. 20–50 images.",
+  },
+  concept: {
+    algo: "", dim: 32, alpha: 16, lr: "0.0001", epochs: 15, min: 1000, max: 3000,
+    hint: "Concept / pose / action. Captions: trigger + full description of the rest (characters, clothes, place).\n" +
+      "Different characters and styles, so the LoRA learns the concept and not a person or style. 40–100 images.",
+  },
+  toolkit: {
+    algo: "", dim: 32, alpha: 16, lr: "0.0001", epochs: 12, min: 2000, max: 6000,
+    hint: "Concept toolkit — one LoRA with several related elements.\n" +
+      "Captions: a shared trigger + an explicit tag for EVERY element present on the image; complex elements get sub-tags.\n" +
+      "Images per element by complexity: simple 15–25, medium 25–50, complex 50–100+. One toolkit = 80–200 images; split into 2–3 toolkits by theme rather than one huge LoRA.\n" +
+      "Balance rare elements with num_repeats (separate dataset folder). Check: each tag alone, then 2–3 together.",
+  },
+};
+
+function adRound(n, to) { return Math.max(to, Math.round(n / to) * to); }
+
+function adCalc() {
+  const imgs = parseInt($("ad-images").value, 10);
+  const ep = parseFloat($("ad-epochs").value);
+  const p = AD_PRESETS[$("ad-preset").value];
+  if (!(imgs > 0) || !(ep > 0)) { $("ad-result").value = ""; $("ad-result-info").textContent = "Uses Batch Size and Gradient Accumulation from the Dataset tab."; return null; }
+  const bs = Math.max(1, safeInt($("cfg-batch-size").value, 1));
+  const ga = Math.max(1, safeInt($("cfg-grad-acc").value, 1));
+  const raw = Math.ceil((imgs * ep) / (bs * ga));
+  let steps = adRound(raw, 50);
+  let note = "";
+  if (p && steps < p.min) { steps = p.min; note = ` (raised to the preset minimum ${p.min})`; }
+  if (p && steps > p.max) { steps = p.max; note = ` (capped at the preset maximum ${p.max} — big dataset needs fewer epochs)`; }
+  const save = adRound(steps / 8, 50);
+  const sample = Math.max(250, adRound(steps / 6, 50));
+  const realEp = (steps * bs * ga / imgs).toFixed(1);
+  $("ad-result").value = `${steps} steps · save every ${save} · samples every ${sample}`;
+  $("ad-result-info").textContent = `${imgs} × ${ep} epochs ÷ (batch ${bs} × accum ${ga}) = ${raw}${note}. ≈ ${realEp} epochs in the end.`;
+  return { steps, save, sample };
+}
+
+function adApplyPreset() {
+  const key = $("ad-preset").value;
+  const p = AD_PRESETS[key];
+  if (!p) { showToast("Choose what you are training first"); return; }
+  if ($("cfg-training-type").value === "full_finetune") { showToast("Presets are for LoRA training, not full finetune"); return; }
+  $("cfg-lx-algo").value = p.algo;
+  $("cfg-lx-factor").value = p.factor ?? "";
+  $("cfg-network-dim").value = p.dim;
+  $("cfg-network-alpha").value = p.alpha;
+  const opt = $("cfg-optimizer").value;
+  const lrSkipped = /prodigy|dadapt/i.test(opt);
+  if (!lrSkipped) $("cfg-learning-rate").value = p.lr;
+  $("cfg-flow-shift").value = 3;
+  if (p.algo && $("cfg-lx-loraplus").value && p.algo !== "dora") $("cfg-lx-loraplus").value = "";
+  if (p.algo && $("cfg-lx-rank-dropout").value) $("cfg-lx-rank-dropout").value = "";
+  $("ad-epochs").value = p.epochs;
+  const res = safeInt($("cfg-resolution").value, 1024);
+  $("ad-preset-hint").textContent = p.hint +
+    `\n\nSet: ${p.algo ? p.algo.toUpperCase() : "LoRA"}, dim ${p.dim} / alpha ${p.alpha}` +
+    (lrSkipped ? `, LR not changed (${opt} picks it itself)` : `, LR ${p.lr}`) +
+    `, flow shift 3` + (res >= 1536 ? " (resolution ≥ 1536: 3 or a bit higher)" : "") +
+    `. Optimizer, resolution and blocks were not touched.`;
+  $("ad-preset-hint").style.display = "block";
+  adCalc();
+  checkDirty();
+  showToast("Preset applied — check the fields and Save");
+}
+
+async function adCount() {
+  const subs = currentSubsets.filter((s) => !s.is_reg && s.image_dir);
+  if (!subs.length) { showToast("No dataset folders on the Dataset tab"); return; }
+  try {
+    const r = await api("/api/count-images", { method: "POST", body: { dirs: subs.map((s) => s.image_dir) } });
+    let total = 0;
+    const parts = [];
+    r.results.forEach((x, i) => {
+      const rep = Math.max(1, safeInt(subs[i].num_repeats, 1));
+      const name = x.dir.split(/[\\/]/).pop();
+      if (x.error) { parts.push(`${name}: ${x.error}`); return; }
+      total += x.images * rep;
+      let s = `${name}: ${x.images}${rep > 1 ? " ×" + rep : ""}`;
+      if (x.captions < x.images) s += ` (no caption: ${x.images - x.captions})`;
+      parts.push(s);
+    });
+    if (total > 0) $("ad-images").value = total;
+    $("ad-images-info").textContent = parts.join(" · ");
+    adCalc();
+  } catch (e) {
+    showToast("Count failed: " + e.message);
+  }
+}
+
+function adFill() {
+  const r = adCalc();
+  if (!r) { showToast("Enter the number of images first"); return; }
+  const stepsRadio = document.querySelector('input[name="duration-unit"][value="steps"]');
+  if (stepsRadio && !stepsRadio.checked) { stepsRadio.checked = true; updateDurationUnit(); }
+  $("cfg-max-steps").value = r.steps;
+  $("cfg-save-every-steps").value = r.save;
+  $("cfg-sample-every-steps").value = r.sample;
+  checkDirty();
+  showToast(`Steps set: ${r.steps}`);
+}
+
+$("ad-preset-apply").addEventListener("click", adApplyPreset);
+$("ad-count").addEventListener("click", adCount);
+$("ad-fill").addEventListener("click", adFill);
+["ad-images", "ad-epochs", "cfg-batch-size", "cfg-grad-acc"].forEach((id) => $(id).addEventListener("input", adCalc));
+$("ad-preset").addEventListener("change", () => {
+  const p = AD_PRESETS[$("ad-preset").value];
+  if (p) { $("ad-epochs").value = p.epochs; adCalc(); }
+});
