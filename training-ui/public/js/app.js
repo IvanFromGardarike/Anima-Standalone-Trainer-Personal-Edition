@@ -3925,10 +3925,12 @@ const AD_PRESETS = {
   },
   character: {
     algo: "", dim: 16, alpha: 8, lr: "0.0001", epochs: 15, min: 800, max: 2500,
-    hint: "Character. Captions: trigger + everything that CHANGES between images (clothes, pose, background, expression, hairstyle if it varies).\n" +
-      "Do NOT caption permanent traits (face, eye/hair colour, ears, freckles…) — the trigger must absorb them.\n" +
-      "Variable traits (glasses, hair up/down, anatomy variants) — caption on every image where they appear, and caption the other variant too.\n" +
-      "Remove hype words (beautiful, sexy, masterpiece) from captions. 30–60 varied images are enough.",
+    hint: "Character. Two captioning schools, both work:\n" +
+      "• Tag everything (Danbooru way, default for Anima): trigger + ALL traits (hair, eyes, piercings…) + what changes. Flexible, traits can be changed in the prompt; you write trigger + key traits when generating.\n" +
+      "• Trigger absorbs the look: trigger + only what CHANGES (clothes, pose, background). Short prompts, but traits stick to the trigger and are harder to change.\n" +
+      "Either way: variable traits (glasses, hair up/down, anatomy variants) are captioned on every image, and the other variant too.\n" +
+      "Remove hype words (beautiful, sexy, masterpiece) from captions. 30–60 varied images are enough.\n" +
+      "Check checkpoints with the character in a DIFFERENT outfit and place: the outfit must change, the look must stay.",
   },
   character_onestyle: {
     algo: "lokr", factor: 8, dim: 100000, alpha: 1, lr: "0.0002", epochs: 15, min: 800, max: 2500,
@@ -3941,6 +3943,7 @@ const AD_PRESETS = {
   character_dora: {
     algo: "dora", dim: 16, alpha: 8, lr: "0.0001", epochs: 15, min: 800, max: 2500,
     hint: "Character with DoRA: often holds small details of the design more precisely than LoRA; trains slower.\n" +
+      "DoRA builds the character early (about a third of the run); 15 epochs did not overcook a 30-image character, 8–10 saves time.\n" +
       "Captions — same rules as the Character preset. Note: AnimaMerger can bake a DoRA into a model, but can't mix it with other LoRAs.",
   },
   object: {
@@ -3962,22 +3965,45 @@ const AD_PRESETS = {
   },
 };
 
+const AD_KNOWN_HINT =
+  "\n\nBase already knows it:\n" +
+  "• Trigger = the base's own tag, with spaces (alexander (fate), not alexander_(fate)), plus the series tag if there is one.\n" +
+  "• First run the base WITHOUT the LoRA on 3–4 seeds and note what it gets wrong — that is what the LoRA must fix and what to watch in samples.\n" +
+  "• Look for a 'neighbour' the base mixes it with (another form, older/younger version, similar character); keep that tag out of captions and put it into the negative if it leaks.\n" +
+  "• Add a sample line with just the base tag: if a checkpoint makes it WORSE than the plain base, it is overriding the base — don't use it.";
+
+function adEff() {
+  const p = AD_PRESETS[$("ad-preset").value];
+  if (!p) return null;
+  if (!$("ad-known").checked) return p;
+  const q = { ...p };
+  if (p.algo !== "lokr") { q.dim = Math.max(8, Math.round(p.dim / 2)); q.alpha = Math.max(4, Math.round(p.alpha / 2)); }
+  q.epochs = Math.max(4, Math.round(p.epochs * 0.6));
+  q.min = Math.round(p.min * 0.6 / 50) * 50;
+  q.max = Math.round(p.max * 0.6 / 50) * 50;
+  q.hint = p.hint + AD_KNOWN_HINT;
+  return q;
+}
+
 function adRound(n, to) { return Math.max(to, Math.round(n / to) * to); }
 
 function adCalc() {
   const imgs = parseInt($("ad-images").value, 10);
   const ep = parseFloat($("ad-epochs").value);
-  const p = AD_PRESETS[$("ad-preset").value];
+  const p = adEff();
   if (!(imgs > 0) || !(ep > 0)) { $("ad-result").value = ""; $("ad-result-info").textContent = "Uses Batch Size and Gradient Accumulation from the Dataset tab."; return null; }
   const bs = Math.max(1, safeInt($("cfg-batch-size").value, 1));
   const ga = Math.max(1, safeInt($("cfg-grad-acc").value, 1));
   const raw = Math.ceil((imgs * ep) / (bs * ga));
   let steps = adRound(raw, 50);
   let note = "";
-  if (p && steps < p.min) { steps = p.min; note = ` (raised to the preset minimum ${p.min})`; }
-  if (p && steps > p.max) { steps = p.max; note = ` (capped at the preset maximum ${p.max} — big dataset needs fewer epochs)`; }
+  // preset limits are in images seen (batch 1); convert to optimizer steps
+  const pMin = p ? adRound(p.min / (bs * ga), 50) : 0;
+  const pMax = p ? adRound(p.max / (bs * ga), 50) : 0;
+  if (p && steps < pMin) { steps = pMin; note = ` (raised to the preset minimum ${pMin})`; }
+  if (p && steps > pMax) { steps = pMax; note = ` (capped at the preset maximum ${pMax} — big dataset needs fewer epochs)`; }
   const save = adRound(steps / 8, 50);
-  const sample = Math.max(250, adRound(steps / 6, 50));
+  const sample = Math.min(Math.max(250, adRound(steps / 6, 50)), adRound(steps / 4, 50));
   const realEp = (steps * bs * ga / imgs).toFixed(1);
   $("ad-result").value = `${steps} steps · save every ${save} · samples every ${sample}`;
   $("ad-result-info").textContent = `${imgs} × ${ep} epochs ÷ (batch ${bs} × accum ${ga}) = ${raw}${note}. ≈ ${realEp} epochs in the end.`;
@@ -3985,8 +4011,7 @@ function adCalc() {
 }
 
 function adApplyPreset() {
-  const key = $("ad-preset").value;
-  const p = AD_PRESETS[key];
+  const p = adEff();
   if (!p) { showToast("Choose what you are training first"); return; }
   if ($("cfg-training-type").value === "full_finetune") { showToast("Presets are for LoRA training, not full finetune"); return; }
   $("cfg-lx-algo").value = p.algo;
@@ -4005,6 +4030,7 @@ function adApplyPreset() {
     `\n\nSet: ${p.algo ? p.algo.toUpperCase() : "LoRA"}, dim ${p.dim} / alpha ${p.alpha}` +
     (lrSkipped ? `, LR not changed (${opt} picks it itself)` : `, LR ${p.lr}`) +
     `, flow shift 3` + (res >= 1536 ? " (resolution ≥ 1536: 3 or a bit higher)" : "") +
+    ($("ad-known").checked ? `, epochs ${p.epochs} (base already knows it)` : "") +
     `. Optimizer, resolution and blocks were not touched.`;
   $("ad-preset-hint").style.display = "block";
   adCalc();
@@ -4052,7 +4078,7 @@ $("ad-preset-apply").addEventListener("click", adApplyPreset);
 $("ad-count").addEventListener("click", adCount);
 $("ad-fill").addEventListener("click", adFill);
 ["ad-images", "ad-epochs", "cfg-batch-size", "cfg-grad-acc"].forEach((id) => $(id).addEventListener("input", adCalc));
-$("ad-preset").addEventListener("change", () => {
-  const p = AD_PRESETS[$("ad-preset").value];
+["ad-preset", "ad-known"].forEach((id) => $(id).addEventListener("change", () => {
+  const p = adEff();
   if (p) { $("ad-epochs").value = p.epochs; adCalc(); }
-});
+}));

@@ -112,6 +112,10 @@
                                 <button class="btn" id="ad-preset-apply" type="button">Apply preset</button>
                             </div>
                         </div>
+                        <div class="form-group" style="margin-top:-4px;">
+                            <label><input type="checkbox" id="ad-known"> Base already knows it (character / style / concept has its own tag in Anima)</label>
+                            <small>Then the LoRA only corrects the base: smaller dim, fewer epochs, and the base's own tag as the trigger.</small>
+                        </div>
                         <div id="ad-preset-hint" class="hint" style="display:none; margin: 4px 0 12px; padding: 10px; background: var(--bg-secondary); border-radius: 4px; border-left: 3px solid var(--accent); line-height: 1.45; white-space: pre-line;"></div>
                         <div style="display:grid; grid-template-columns:1fr auto 1fr; gap:16px; align-items:end;">
                             <div class="form-group">
