@@ -134,6 +134,43 @@ app.get('/api/architectures', (req, res) => {
     res.json(ARCH_REGISTRY);
 });
 
+// [AniDream patch] List DiT models for the per-job model picker.
+// Scans the folder of the global DiT + folders from global_config "model_scan_dirs" (one level of subfolders).
+app.get('/api/models', (req, res) => {
+    try {
+        const gc = getGlobalConfig();
+        const dirs = new Set();
+        const globalDit = stripQuotes(gc.model_paths?.dit_path || '');
+        if (globalDit) dirs.add(path.dirname(globalDit));
+        for (const d of (gc.model_scan_dirs || [])) {
+            const dd = stripQuotes(String(d)).trim();
+            if (dd) dirs.add(dd);
+        }
+        const MIN_SIZE = 1024 * 1024 * 1024; // >1 GB: full models only, skip LoRAs
+        const files = [];
+        const seen = new Set();
+        const scan = (dir, depth) => {
+            let entries = [];
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+            for (const e of entries) {
+                const full = path.join(dir, e.name);
+                if (e.isDirectory() && depth > 0) { scan(full, depth - 1); continue; }
+                if (!e.isFile() || !e.name.toLowerCase().endsWith('.safetensors')) continue;
+                let size = 0;
+                try { size = fs.statSync(full).size; } catch { continue; }
+                if (size < MIN_SIZE || seen.has(full.toLowerCase())) continue;
+                seen.add(full.toLowerCase());
+                files.push({ path: full, name: e.name, size_gb: +(size / 1073741824).toFixed(2) });
+            }
+        };
+        for (const d of dirs) scan(d, 1);
+        files.sort((a, b) => a.name.localeCompare(b.name));
+        res.json({ global_dit: globalDit, dirs: [...dirs], files });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/gpu/activity', (req, res) => {
     const activity = {};
 
@@ -356,6 +393,16 @@ function buildTrainingConfig(jobName, jobPath) {
     // Model arguments from global config, mapped through registry
     merged.model_arguments = buildModelArgs(arch, globalConfig);
 
+    // [AniDream patch] Per-job DiT override: if the job has its own model, use it instead of the global one
+    const ditOverride = stripQuotes(jobConfig.model_override?.dit_path || '').trim();
+    if (ditOverride) {
+        if (!fs.existsSync(ditOverride)) {
+            throw new Error(`Job model not found: ${ditOverride}. Fix the "Base Model" field on the Network tab or clear it to use the global model.`);
+        }
+        merged.model_arguments.dit_path = ditOverride;
+        console.log(`[model-override] ${jobName}: using DiT ${ditOverride}`);
+    }
+
     // Dataset arguments
     merged.dataset_arguments = {
         dataset_config: datasetConfigPath,
@@ -415,6 +462,11 @@ function buildTrainingConfig(jobName, jobPath) {
                 }
             }
         }
+    }
+
+    // [AniDream patch] 0 = save only the final model (sd-scripts would do x % 0)
+    for (const k of ['save_every_n_steps', 'save_every_n_epochs']) {
+        if (Number(merged.training_arguments[k]) === 0) delete merged.training_arguments[k];
     }
 
     delete merged.training_arguments.sample_every_n_epochs;
@@ -1182,6 +1234,76 @@ app.get('/api/jobs/:name/checkpoints', (req, res) => {
             .sort((a, b) => b.mtime - a.mtime);
 
         res.json(files);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// [AniDream patch] Disk usage of a job's output folder
+function dirSize(p) {
+    let total = 0;
+    try {
+        for (const e of fs.readdirSync(p, { withFileTypes: true })) {
+            const full = path.join(p, e.name);
+            if (e.isDirectory()) total += dirSize(full);
+            else { try { total += fs.statSync(full).size; } catch {} }
+        }
+    } catch {}
+    return total;
+}
+function listJobStorage(jobPath) {
+    const outputDir = path.join(jobPath, 'output');
+    const res = { checkpoints: [], states: [], samples_bytes: 0, latest_state: null };
+    if (!fs.existsSync(outputDir)) return res;
+    for (const e of fs.readdirSync(outputDir, { withFileTypes: true })) {
+        const full = path.join(outputDir, e.name);
+        let st; try { st = fs.statSync(full); } catch { continue; }
+        if (e.isFile() && e.name.endsWith('.safetensors')) {
+            const m = e.name.match(/-step(\d+)\.safetensors$/) || e.name.match(/-(\d{6})\.safetensors$/);
+            res.checkpoints.push({ name: e.name, bytes: st.size, mtime: st.mtimeMs, step: m ? parseInt(m[1]) : null });
+        } else if (e.isDirectory() && e.name.endsWith('-state')) {
+            res.states.push({ name: e.name, bytes: dirSize(full), mtime: st.mtimeMs });
+        } else if (e.isDirectory() && e.name === 'sample') {
+            res.samples_bytes = dirSize(full);
+        }
+    }
+    res.checkpoints.sort((a, b) => (a.step ?? Infinity) - (b.step ?? Infinity) || a.mtime - b.mtime);
+    res.states.sort((a, b) => b.mtime - a.mtime);
+    const last = findLastStateDir(jobPath);
+    res.latest_state = last ? path.basename(last) : null;
+    return res;
+}
+app.get('/api/jobs/:name/storage', (req, res) => {
+    try {
+        res.json(listJobStorage(getJobPath(req.params.name)));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+app.post('/api/jobs/:name/cleanup', (req, res) => {
+    try {
+        const jobName = sanitizeName(req.params.name);
+        if (runningJobs.has(jobName)) return res.status(400).json({ error: 'Stop the job before cleaning up.' });
+        const jobPath = getJobPath(jobName);
+        const outputDir = path.join(jobPath, 'output');
+        const info = listJobStorage(jobPath);
+        const knownCk = new Set(info.checkpoints.map(c => c.name));
+        const knownSt = new Set(info.states.map(s => s.name));
+        const delFiles = (req.body.delete_checkpoints || []).filter(n => knownCk.has(n));
+        let delStates = (req.body.delete_states || []).filter(n => knownSt.has(n));
+        if (!req.body.allow_latest_state && info.latest_state) delStates = delStates.filter(n => n !== info.latest_state);
+        let freed = 0; const done = []; const failed = [];
+        for (const n of delFiles) {
+            const full = path.join(outputDir, n);
+            try { const sz = fs.statSync(full).size; fs.unlinkSync(full); freed += sz; done.push(n); }
+            catch (e) { failed.push(`${n}: ${e.message}`); }
+        }
+        for (const n of delStates) {
+            const full = path.join(outputDir, n);
+            try { const sz = dirSize(full); fs.rmSync(full, { recursive: true }); freed += sz; done.push(n); }
+            catch (e) { failed.push(`${n}: ${e.message}`); }
+        }
+        res.json({ success: true, deleted: done, failed, freed_bytes: freed });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

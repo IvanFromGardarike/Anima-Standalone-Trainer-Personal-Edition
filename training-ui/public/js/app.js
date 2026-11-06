@@ -309,6 +309,7 @@ async function selectJob(name) {
     // Load samples
     loadSamples();
     loadCheckpoints();
+    loadStorage(); // [AniDream patch]
     loadPromptTransientSettings();
   } catch (err) {
     console.error(`Failed to load job "${name}":`, err);
@@ -337,9 +338,12 @@ function populateConfig(config) {
   const t = config.training_arguments || {};
   const n = config.network_arguments || {};
   const a = config.anima_arguments || {};
+  // [AniDream patch] per-job model
+  $("cfg-dit-override").value = config.model_override?.dit_path || "";
+  updateDitOverrideHint();
   // Training
   $("cfg-learning-rate").value = t.learning_rate || "5e-5";
-  $("cfg-text-encoder-lr").value = t.text_encoder_lr || "5e-5";
+  $("cfg-text-encoder-lr").value = t.text_encoder_lr ?? "5e-5"; // [AniDream patch] ?? keeps 0
   if (t.use_muon) {
     $("cfg-optimizer").value = "Muon";
   } else {
@@ -350,6 +354,7 @@ function populateConfig(config) {
   $("cfg-lr-scheduler-cycles").value = t.lr_scheduler_num_cycles ?? 1;
   $("cfg-lr-min-ratio").value = t.lr_scheduler_min_lr_ratio ?? 0;
   $("cfg-seed").value = t.seed ?? 42;
+  $("cfg-max-grad-norm").value = t.max_grad_norm ?? 1; // [AniDream patch]
   // Extract weight decay
   let wdValue = "0";
   let decoupleValue = true;
@@ -563,7 +568,28 @@ function populateConfig(config) {
   $("cfg-resume").value = n.resume || "";
   $("cfg-resume").disabled = $("cfg-auto-resume").checked;
   $("cfg-network-dropout").value = n.network_dropout ?? 0;
-  $("cfg-network-args").value = (n.network_args || []).join(" ");
+  // [AniDream patch] split network_args into structured fields + free text
+  {
+    const rest = [];
+    const kv = {};
+    for (const tok of n.network_args || []) {
+      const i = String(tok).indexOf("=");
+      const k = i > 0 ? String(tok).slice(0, i) : "";
+      if (k && LX_KEYS.includes(k)) kv[k] = String(tok).slice(i + 1);
+      else rest.push(tok);
+    }
+    $("cfg-lx-blocks").value = kv.train_block_indices ?? "";
+    $("cfg-lx-self-dim").value = kv.self_attn_dim ?? "";
+    $("cfg-lx-cross-dim").value = kv.cross_attn_dim ?? "";
+    $("cfg-lx-mlp-dim").value = kv.mlp_dim ?? "";
+    $("cfg-lx-mod-dim").value = kv.mod_dim ?? "";
+    $("cfg-lx-loraplus").value = kv.loraplus_lr_ratio ?? kv.loraplus_unet_lr_ratio ?? "";
+    $("cfg-lx-rank-dropout").value = kv.rank_dropout ?? "";
+    $("cfg-lx-module-dropout").value = kv.module_dropout ?? "";
+    $("cfg-lx-llm-adapter").checked = String(kv.train_llm_adapter ?? "") === "True";
+    $("cfg-network-args").value = rest.join(" ");
+  }
+  $("cfg-fp8-base").checked = t.fp8_base ?? false; // [AniDream patch]
   // HuggingFace
   const hfEnabled = !!t.huggingface_repo_id;
   $("cfg-hf-enable").checked = hfEnabled;
@@ -776,11 +802,12 @@ function gatherConfig() {
       save_precision: $("cfg-save-precision").value || undefined,
       max_data_loader_n_workers: safeInt($("cfg-workers").value),
       gradient_accumulation_steps: safeInt($("cfg-grad-acc").value),
-      max_grad_norm: 1.0,
+      max_grad_norm: safeFloat($("cfg-max-grad-norm").value, 1.0), // [AniDream patch]
       gradient_checkpointing: $("cfg-gradient-checkpointing").checked,
       flash_attn: $("cfg-flash-attn").checked,
       torch_compile: $("cfg-torch-compile").checked,
       lowram: $("cfg-lowram").checked,
+      ...($("cfg-fp8-base").checked && { fp8_base: true }), // [AniDream patch]
       blocks_to_swap: safeInt($("cfg-blocks-to-swap").value),
       ...($("cfg-activation-offload").value === "cpu" && {
         cpu_offload_checkpointing: true,
@@ -925,14 +952,12 @@ function gatherConfig() {
       : {
           network_module: $("cfg-network-module").value,
           network_dim: safeInt($("cfg-network-dim").value),
-          network_alpha: safeInt($("cfg-network-alpha").value),
+          network_alpha: safeFloat($("cfg-network-alpha").value),
           network_train_unet_only: $("cfg-unet-only").checked,
           ...(safeFloat($("cfg-network-dropout").value) > 0 && {
             network_dropout: safeFloat($("cfg-network-dropout").value),
           }),
-          ...($("cfg-network-args").value.trim() && {
-            network_args: $("cfg-network-args").value.trim().split(/\s+/),
-          }),
+          ...(gatherNetworkArgs().length && { network_args: gatherNetworkArgs() }), // [AniDream patch]
           ...($("cfg-network-weights").value && {
             network_weights: $("cfg-network-weights").value,
           }),
@@ -949,8 +974,70 @@ function gatherConfig() {
     )
       .map((cb) => cb.value)
       .join(","),
+    // [AniDream patch] per-job model (empty = global)
+    model_override: {
+      dit_path: $("cfg-dit-override").value.trim().replace(/^["']|["']$/g, ""),
+    },
   };
   return config;
+}
+
+// [AniDream patch] per-job model picker
+let ditModelList = { global_dit: "", files: [] };
+async function loadDitModels() {
+  try {
+    ditModelList = await api("/api/models");
+    const dl = $("dit-model-list");
+    dl.innerHTML = "";
+    for (const f of ditModelList.files) {
+      const opt = document.createElement("option");
+      opt.value = f.path;
+      opt.label = `${f.name}  (${f.size_gb} GB)`;
+      dl.appendChild(opt);
+    }
+  } catch (err) {
+    console.warn("Failed to load model list:", err);
+  }
+  updateDitOverrideHint();
+}
+function updateDitOverrideHint() {
+  const hint = $("dit-override-hint");
+  const inp = $("cfg-dit-override");
+  if (!hint || !inp) return;
+  const g = ditModelList.global_dit || "(not set)";
+  inp.placeholder = `(global) ${g.split(/[\\/]/).pop()}`;
+  hint.textContent = inp.value.trim()
+    ? "This job uses its own model. Clear the field to go back to the global one."
+    : `Uses the global DiT: ${g}`;
+}
+$("btn-refresh-models").addEventListener("click", loadDitModels);
+$("cfg-dit-override").addEventListener("input", updateDitOverrideHint);
+loadDitModels();
+// [AniDream patch]
+const LX_KEYS = ["train_block_indices", "self_attn_dim", "cross_attn_dim", "mlp_dim", "mod_dim",
+  "loraplus_lr_ratio", "loraplus_unet_lr_ratio", "rank_dropout", "module_dropout", "train_llm_adapter"];
+function gatherNetworkArgs() {
+  const out = [];
+  const add = (k, v) => { if (v !== "" && v !== null && v !== undefined) out.push(`${k}=${v}`); };
+  const blocks = $("cfg-lx-blocks").value.replace(/\s+/g, "");
+  if (blocks && blocks.toLowerCase() !== "all") add("train_block_indices", blocks);
+  add("self_attn_dim", $("cfg-lx-self-dim").value.trim());
+  add("cross_attn_dim", $("cfg-lx-cross-dim").value.trim());
+  add("mlp_dim", $("cfg-lx-mlp-dim").value.trim());
+  add("mod_dim", $("cfg-lx-mod-dim").value.trim());
+  const lp = $("cfg-lx-loraplus").value.trim();
+  if (lp && Number(lp) > 0) add("loraplus_lr_ratio", lp);
+  const rd = $("cfg-lx-rank-dropout").value.trim();
+  if (rd && Number(rd) > 0) add("rank_dropout", rd);
+  const md = $("cfg-lx-module-dropout").value.trim();
+  if (md && Number(md) > 0) add("module_dropout", md);
+  if ($("cfg-lx-llm-adapter").checked) add("train_llm_adapter", "True");
+  const setKeys = new Set(out.map((s) => s.split("=")[0]));
+  for (const tok of $("cfg-network-args").value.trim().split(/\s+/).filter(Boolean)) {
+    const k = tok.split("=")[0];
+    if (!setKeys.has(k)) out.push(tok);
+  }
+  return out;
 }
 function gatherDataset() {
   const res = safeInt($("cfg-resolution").value);
@@ -1692,6 +1779,71 @@ async function loadCheckpoints() {
     select.value = valToRestore;
   }
 }
+// [AniDream patch] Disk usage & cleanup
+let storageInfo = null;
+const fmtGB = (b) => (b / 1073741824).toFixed(2) + " GB";
+const fmtMB = (b) => b >= 1073741824 ? fmtGB(b) : (b / 1048576).toFixed(0) + " MB";
+async function loadStorage() {
+  if (!currentJob) return;
+  const jobAtStart = currentJob;
+  try {
+    storageInfo = await api(`/api/jobs/${currentJob}/storage`);
+  } catch (err) {
+    $("storage-summary").innerHTML = `<small>Failed: ${err.message}</small>`;
+    return;
+  }
+  if (currentJob !== jobAtStart) return;
+  const ck = storageInfo.checkpoints, st = storageInfo.states;
+  const ckBytes = ck.reduce((s, c) => s + c.bytes, 0);
+  const stBytes = st.reduce((s, c) => s + c.bytes, 0);
+  $("storage-summary").innerHTML =
+    `<small>Checkpoints: <b>${ck.length}</b> (${fmtMB(ckBytes)}) · Optimizer states: <b>${st.length}</b> (${fmtMB(stBytes)}) · Samples: ${fmtMB(storageInfo.samples_bytes)}</small>`;
+  const steps = ck.filter((c) => c.step !== null);
+  const newest = steps.length ? steps[steps.length - 1].name : null;
+  const list = $("storage-list");
+  list.innerHTML = "";
+  for (const c of ck) {
+    const keep = c.step === null || c.name === newest;
+    const row = document.createElement("label");
+    row.style.cssText = "display:flex; gap:8px; align-items:center; font-size:0.85rem;";
+    row.innerHTML = `<input type="checkbox" class="storage-keep" data-name="${c.name}" ${keep ? "checked" : ""}>
+      <span style="flex:1;">${c.name}</span><span style="opacity:0.7;">${fmtMB(c.bytes)}</span>`;
+    list.appendChild(row);
+  }
+  if (!ck.length) list.innerHTML = "<small>No checkpoints yet.</small>";
+}
+function planCleanup() {
+  if (!storageInfo) return null;
+  const keep = new Set(Array.from(document.querySelectorAll(".storage-keep:checked")).map((e) => e.dataset.name));
+  const delCk = storageInfo.checkpoints.filter((c) => !keep.has(c.name));
+  const delLast = $("storage-del-last-state").checked;
+  const delSt = storageInfo.states.filter((s) =>
+    s.name === storageInfo.latest_state ? delLast : $("storage-del-step-states").checked);
+  const bytes = delCk.reduce((s, c) => s + c.bytes, 0) + delSt.reduce((s, c) => s + c.bytes, 0);
+  return { delCk, delSt, delLast, bytes };
+}
+$("btn-storage-refresh").addEventListener("click", loadStorage);
+$("btn-storage-cleanup").addEventListener("click", () => {
+  const plan = planCleanup();
+  if (!plan || (!plan.delCk.length && !plan.delSt.length)) { showToast("Nothing to delete"); return; }
+  const lines = [...plan.delCk.map((c) => c.name), ...plan.delSt.map((s) => s.name + "/")];
+  const shown = lines.slice(0, 12).join("\n") + (lines.length > 12 ? `\n… and ${lines.length - 12} more` : "");
+  showConfirm("Delete files?",
+    `This permanently deletes ${lines.length} item(s), ${fmtMB(plan.bytes)}:\n\n${shown}` +
+    (plan.delLast ? "\n\nThe latest state is included — this job can't be resumed afterwards." : ""),
+    async () => {
+      try {
+        const r = await api(`/api/jobs/${currentJob}/cleanup`, {
+          method: "POST",
+          body: { delete_checkpoints: plan.delCk.map((c) => c.name), delete_states: plan.delSt.map((s) => s.name), allow_latest_state: plan.delLast },
+        });
+        showToast(`Freed ${fmtMB(r.freed_bytes)}` + (r.failed.length ? ` · ${r.failed.length} failed` : ""));
+      } catch (err) { showToast(`Cleanup failed: ${err.message}`); }
+      loadStorage();
+      loadCheckpoints();
+    });
+});
+
 // Sample State
 let sampleState = {
   selectedPaths: new Set(),
@@ -2524,6 +2676,7 @@ async function loadGlobalSettings() {
     }
   }
   $("cfg-global-venv").value = config.venv_path || "";
+  $("cfg-global-model-dirs").value = (config.model_scan_dirs || []).join("\n");
   // Theme
   const theme = config.ui?.theme || "github-dark";
   $("cfg-theme").value = theme;
@@ -2573,6 +2726,8 @@ async function saveGlobalSettings() {
   const config = {
     model_paths,
     venv_path: $("cfg-global-venv").value,
+    model_scan_dirs: $("cfg-global-model-dirs").value
+      .split(/\r?\n/).map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean),
     ui: {
       ...(existingConfig.ui || {}),
       theme: $("cfg-theme").value,
@@ -2599,6 +2754,7 @@ async function saveGlobalSettings() {
   await api("/api/global-config", { method: "PUT", body: config });
   closeModal("modal-global-settings");
   showToast("Global settings saved");
+  loadDitModels(); // [AniDream patch]
 }
 // === Background Image Functions ===
 function applyBackground(

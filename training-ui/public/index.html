@@ -256,7 +256,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label>Save Every N Epochs</label>
-                                    <input type="number" id="cfg-save-every" value="1" min="1">
+                                    <input type="number" id="cfg-save-every" value="1" min="0" title="0 = save only the final model">
                                 </div>
                                 <div class="form-group">
                                     <label>Keep Last N Epochs</label>
@@ -278,7 +278,7 @@
                                 </div>
                                 <div class="form-group">
                                     <label>Save Every N Steps</label>
-                                    <input type="number" id="cfg-save-every-steps" value="500" min="1">
+                                    <input type="number" id="cfg-save-every-steps" value="500" min="0" title="0 = save only the final model">
                                 </div>
                                 <div class="form-group">
                                     <label>Keep Last N Steps</label>
@@ -342,11 +342,16 @@
                         </div>
                         <div class="form-group">
                             <label><input type="checkbox" id="cfg-flash-attn"> Flash Attention</label>
-                            <small>Requires flash-attn package.</small>
+                            <small>Requires the flash-attn package. If it isn't installed, training silently falls back to PyTorch SDPA (see "flash_attn package not installed" in the console) — then this box does nothing.</small>
                         </div>
                         <div id="group-torch-compile" class="form-group">
                             <label><input type="checkbox" id="cfg-torch-compile"> Torch Compile</label>
                             <small>Uses dynamo inductor backend. Slower first step, faster training after.</small>
+                        </div>
+                        <!-- [AniDream patch] -->
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-fp8-base"> FP8 Base Model (experimental)</label>
+                            <small>Keeps the frozen DiT in FP8: saves ~2 GB VRAM. Not faster by itself on RTX 30xx, but the freed memory can let you turn off activation offload or raise batch size. Test on a short run first.</small>
                         </div>
                         <div class="form-row">
                             <div class="form-group" style="flex: 1;">
@@ -439,6 +444,12 @@
                                 <label>Gradient Accumulation</label>
                                 <input type="number" id="cfg-grad-acc" value="1" min="1" max="128">
                             </div>
+                            <!-- [AniDream patch] -->
+                            <div class="form-group">
+                                <label>Max Grad Norm</label>
+                                <input type="number" id="cfg-max-grad-norm" value="1" min="0" step="0.1">
+                                <small>Gradient clipping. 0 = off (often recommended for Prodigy / Adafactor / schedule-free optimizers).</small>
+                            </div>
                             <div class="form-group">
                                 <label>Caption Extension</label>
                                 <input type="text" id="cfg-caption-ext" value=".txt" placeholder=".txt">
@@ -525,6 +536,16 @@
 
                     <!-- Network Tab -->
                     <div id="tab-network" class="tab-pane hidden">
+                        <!-- [AniDream patch] per-job model -->
+                        <div class="form-group">
+                            <label>Base Model (DiT) for this job</label>
+                            <div style="display:flex; gap:8px;">
+                                <input type="text" id="cfg-dit-override" list="dit-model-list" placeholder="(global model)" style="flex:1;">
+                                <button type="button" id="btn-refresh-models" class="btn btn-sm" title="Refresh model list">&#x21bb;</button>
+                            </div>
+                            <datalist id="dit-model-list"></datalist>
+                            <small id="dit-override-hint">Empty = use the global DiT from Global Settings. Pick from the list or paste a path. Latent / text caches stay valid — VAE and Qwen3 don't change.</small>
+                        </div>
                         <div class="form-group">
                             <label>Training Type</label>
                             <select id="cfg-training-type">
@@ -552,8 +573,8 @@
                                 </div>
                                 <div class="form-group">
                                     <label>Network Alpha</label>
-                                    <input type="number" id="cfg-network-alpha" value="16" min="1">
-                                    <small>Scaling factor. Usually same as dim.</small>
+                                    <input type="number" id="cfg-network-alpha" value="16" min="0" step="any">
+                                    <small>Scaling factor. Usually same as dim. 0 = same as dim.</small>
                                 </div>
                             </div>
                             <div class="form-group">
@@ -567,10 +588,35 @@
                                     <small>Dropout rate (0-1). Randomly zeroes LoRA neurons to reduce overfitting. 0 = off.</small>
                                 </div>
                             </div>
+                            <!-- [AniDream patch] advanced Anima LoRA options (stored as network_args) -->
+                            <h4 style="margin-top:12px;">Advanced (Anima LoRA)</h4>
+                            <div class="form-group">
+                                <label>Blocks to Train</label>
+                                <input type="text" id="cfg-lx-blocks" placeholder="all  (e.g. 14-27  or  0-7,14-27)">
+                                <small>Which DiT blocks get LoRA. Empty = all. 2B has blocks 0-27, 2.9B has 0-39: early blocks = composition, late = details/texture.</small>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group"><label>Self-Attn Dim</label><input type="number" id="cfg-lx-self-dim" min="0" placeholder="= dim"></div>
+                                <div class="form-group"><label>Cross-Attn Dim</label><input type="number" id="cfg-lx-cross-dim" min="0" placeholder="= dim"></div>
+                                <div class="form-group"><label>MLP Dim</label><input type="number" id="cfg-lx-mlp-dim" min="0" placeholder="= dim"></div>
+                                <div class="form-group"><label>Modulation Dim</label><input type="number" id="cfg-lx-mod-dim" min="0" placeholder="= dim"></div>
+                            </div>
+                            <small style="display:block; margin-top:-6px; margin-bottom:10px;">Rank per layer type. Empty = Network Dim, 0 = don't train this type. Cross-attn = how the prompt is understood (trigger words), MLP = how things are drawn.</small>
+                            <div class="form-row">
+                                <div class="form-group"><label>LoRA+ Ratio</label><input type="number" id="cfg-lx-loraplus" min="0" step="1" placeholder="off (e.g. 16)">
+                                    <small>LoRA up-matrices learn N× faster. Often 16. Not for Prodigy / DAdapt.</small></div>
+                                <div class="form-group"><label>Rank Dropout</label><input type="number" id="cfg-lx-rank-dropout" min="0" max="1" step="0.05" placeholder="0">
+                                    <small>Against overfitting. 0.1 is a mild value.</small></div>
+                                <div class="form-group"><label>Module Dropout</label><input type="number" id="cfg-lx-module-dropout" min="0" max="1" step="0.05" placeholder="0"></div>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-lx-llm-adapter"> Train LLM Adapter</label>
+                                <small>Also put LoRA on the Qwen3→DiT adapter. Usually OFF: can hurt prompt understanding. Only for new concepts the model can't "hear".</small>
+                            </div>
                             <div class="form-group">
                                 <label>Network Args</label>
                                 <input type="text" id="cfg-network-args" placeholder="e.g. conv_dim=4 conv_alpha=4">
-                                <small>Space-separated key=value pairs passed to the network module.</small>
+                                <small>Space-separated key=value pairs passed to the network module. Options from "Advanced" above are added automatically — no need to type them here.</small>
                             </div>
                             <div class="form-group">
                                 <label>Network Weights (LoRA checkpoint)</label>
@@ -735,6 +781,27 @@
                                         style="min-width: 120px;">Generate</button>
                                 </div>
                             </div>
+                        </div>
+
+                        <!-- [AniDream patch] disk usage / checkpoint cleanup -->
+                        <div class="section-card" id="storage-card">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <h4>Disk Usage &amp; Cleanup</h4>
+                                <button id="btn-storage-refresh" class="btn btn-secondary btn-sm" title="Refresh">🔄</button>
+                            </div>
+                            <div id="storage-summary"><small>Loading...</small></div>
+                            <div id="storage-list" style="display:flex; flex-direction:column; gap:4px; margin-top:8px; max-height:260px; overflow:auto;"></div>
+                            <div class="form-group" style="margin-top:10px;">
+                                <label><input type="checkbox" id="storage-del-step-states" checked> Delete old optimizer states (<code>-stepNNN-state</code>)</label>
+                                <small>The latest <code>-state</code> folder is always kept, so "Auto-resume" still works.</small>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="storage-del-last-state"> Also delete the latest state (can't resume after this)</label>
+                            </div>
+                            <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:6px;">
+                                <button id="btn-storage-cleanup" class="btn btn-danger">Delete unchecked</button>
+                            </div>
+                            <small>Checked checkpoints are kept. By default the final model and the newest step are checked — tick any others you liked in the samples.</small>
                         </div>
 
                         <div class="prompts-header" style="flex-direction: column; align-items: stretch; gap: 10px;">
@@ -1197,7 +1264,7 @@
     <div id="modal-confirm" class="modal hidden">
         <div class="modal-content modal-confirm-content">
             <h3 id="confirm-title">Confirm</h3>
-            <p id="confirm-message">Are you sure?</p>
+            <p id="confirm-message" style="white-space: pre-line;">Are you sure?</p>
             <div class="modal-actions" id="confirm-actions"></div>
         </div>
     </div>
@@ -1223,6 +1290,13 @@
                         <label>Python Venv Path</label>
                         <input type="text" id="cfg-global-venv" placeholder="C:\sd-scripts\venv">
                         <small>Path to the Python virtual environment with training dependencies.</small>
+                    </div>
+
+                    <!-- [AniDream patch] folders for the per-job model picker -->
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label>Model folders for job picker</label>
+                        <textarea id="cfg-global-model-dirs" rows="3" placeholder="D:\Models\StableDiffusion&#10;D:\Models\StableDiffusion\merge"></textarea>
+                        <small>One folder per line. Models (&gt;1 GB .safetensors) from these folders and their subfolders appear in the job's "Base Model" list. The global DiT folder is always included.</small>
                     </div>
 
                     <div class="form-group" style="margin-top: 15px;">

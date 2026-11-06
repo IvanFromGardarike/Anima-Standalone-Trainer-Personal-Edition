@@ -1,0 +1,40 @@
+# AniDream patch для Anima-Standalone-Trainer
+
+Изменённые файлы (все правки помечены комментарием `[AniDream patch]`):
+- `training-ui/server.js`
+- `training-ui/public/index.html`
+- `training-ui/public/js/app.js`
+
+Это личный форк. Upstream, на котором основан патч, — коммит `7f5c336`; все правки — отдельные коммиты поверх него.
+Обновиться с upstream: добавить его как remote `upstream`, затем `git fetch upstream` → `git merge upstream/main`.
+
+## 1. Своя модель (DiT) у каждой задачи
+- Вкладка Network → поле «Base Model (DiT) for this job». Пусто = глобальная модель (старые задачи работают как раньше).
+- Выпадающий список: модели >1 ГБ из папки глобальной DiT и из папок, указанных в Global Settings → Application → «Model folders for job picker» (плюс один уровень подпапок).
+- Хранится в `config.toml` задачи как `[model_override] dit_path = "..."`.
+- Если файла нет — обучение не стартует, с понятной ошибкой.
+- Генерация сэмплов из интерфейса тоже использует модель задачи.
+
+## 2. Баги с нулями
+- Text Encoder LR: 0 больше не подменяется на 5e-5 при открытии задачи (`||` → `??`).
+- Network Alpha: можно 0 (= как dim) и дробные значения.
+- Save every N epochs / steps: можно 0 = сохранять только финальную модель (сервер не передаёт 0 в sd-scripts, там было бы деление на ноль).
+- Max Grad Norm: новое поле (раньше жёстко 1.0). 0 = клиппинг выключен.
+
+## 3. Скрытые настройки LoRA (вкладка Network → «Advanced (Anima LoRA)»)
+Пишутся в `network_args`, старые задачи открываются как раньше (известные ключи из поля Network Args переезжают в поля).
+- Blocks to Train (`train_block_indices`), например `14-27`.
+- Ранг по типам слоёв: Self-Attn / Cross-Attn / MLP / Modulation (`self_attn_dim` …), 0 = не обучать этот тип.
+- LoRA+ (`loraplus_lr_ratio`), Rank Dropout, Module Dropout.
+- Train LLM Adapter (`train_llm_adapter=True`).
+
+## 4. Ещё в настройках обучения
+- FP8 Base Model (экспериментально, `fp8_base`) — экономит ~2 ГБ VRAM.
+- Validation Split / Validate Every N Steps — validation loss в TensorBoard.
+- Подсказка у Flash Attention: без пакета flash-attn галочка ничего не делает.
+
+## 5. Disk Usage & Cleanup (вкладка с Test Generation)
+- Сколько места занимают чекпоинты, состояния оптимизатора и сэмплы.
+- Галочки «оставить» у чекпоинтов (по умолчанию финальный и последний шаг), удаление старых `-stepNNN-state`.
+- Последний `-state` не удаляется без отдельной галочки (иначе не будет Auto-resume).
+- Удаление только после подтверждения со списком файлов; во время обучения запрещено.
