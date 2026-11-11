@@ -48,6 +48,21 @@
             <div id="job-list" class="job-list">
                 <!-- Jobs rendered here -->
             </div>
+            <div id="queue-panel" class="queue-panel">
+                <div class="queue-header">
+                    <span class="queue-title">⏭ Queue <span id="queue-count" class="queue-count">0</span></span>
+                    <span id="queue-state" class="queue-state">idle</span>
+                </div>
+                <div id="queue-current" class="queue-current hidden"></div>
+                <ol id="queue-list" class="queue-list"></ol>
+                <div class="queue-controls">
+                    <button id="btn-queue-start" class="btn btn-primary btn-sm" title="Start the queue. If a training is running, the queue waits for it to finish.">▶ Start</button>
+                    <button id="btn-queue-pause" class="btn btn-secondary btn-sm hidden" title="Do not start further jobs. The current training keeps running.">⏸ Pause</button>
+                    <button id="btn-queue-clear" class="btn btn-ghost btn-sm" title="Remove all waiting jobs">Clear</button>
+                </div>
+                <label class="queue-option" title="If a job fails, pause the queue instead of moving on to the next one"><input type="checkbox" id="chk-queue-stop-on-error"> Stop on error</label>
+                <div id="queue-error" class="queue-error hidden"></div>
+            </div>
             <div class="sidebar-footer">
                 <button id="btn-global-settings" class="btn btn-ghost btn-block">⚙️ Global Settings</button>
             </div>
@@ -69,6 +84,7 @@
                         <button id="btn-discard" class="btn btn-danger hidden">Discard</button>
                         <button id="btn-clone" class="btn btn-secondary">Clone</button>
                         <button id="btn-run" class="btn btn-primary">▶ Train</button>
+                        <button id="btn-queue-add" class="btn btn-secondary" title="Add this job to the training queue">＋ Queue</button>
                         <button id="btn-stop" class="btn btn-danger hidden">⏹ Stop</button>
                         <button id="btn-delete" class="btn btn-danger" title="Delete">🗑</button>
                     </div>

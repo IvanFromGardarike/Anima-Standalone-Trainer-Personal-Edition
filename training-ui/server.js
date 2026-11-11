@@ -1210,6 +1210,7 @@ app.post('/api/jobs/:name/train/stop', async (req, res) => {
 
         runningJobs.delete(jobName);
         broadcastStatus(jobName, 'stopping');
+        markQueueUserStop(jobName);
 
         if (job.pid) {
             killProcess(job.pid, 8000).catch(() => {});
@@ -1604,17 +1605,175 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
 
 // --- Training Control ---
 
-app.post('/api/jobs/:name/train/start', async (req, res) => {
+// --- Training Queue (AniDream patch) ---
+// Jobs added here start one after another: when the current training ends,
+// the next queued job starts automatically. State survives UI restarts.
+const QUEUE_FILE = path.join(__dirname, 'queue.json');
+let trainQueue = { items: [], active: false, stopOnError: false, current: null, lastError: '', history: [] };
+let queueUserStopped = new Set();
+let queueTimer = null;
+
+function loadQueue() {
     try {
-        const jobName = sanitizeName(req.params.name);
+        if (fs.existsSync(QUEUE_FILE)) {
+            const q = JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8'));
+            trainQueue = Object.assign(trainQueue, q);
+            // A job that was "current" when the UI closed is not running any more.
+            if (trainQueue.current && !runningJobs.has(trainQueue.current)) trainQueue.current = null;
+            // Never auto-resume after a restart: the user presses Start again.
+            trainQueue.active = false;
+        }
+    } catch (e) {
+        console.warn('Queue: failed to load queue.json:', e.message);
+    }
+}
+function saveQueue() {
+    try {
+        fs.writeFileSync(QUEUE_FILE, JSON.stringify(trainQueue, null, 2), 'utf8');
+    } catch (e) {
+        console.warn('Queue: failed to save queue.json:', e.message);
+    }
+}
+function queueLog(text) {
+    const line = `[${new Date().toLocaleString()}] ${text}`;
+    console.log('Queue: ' + text);
+    trainQueue.history.unshift(line);
+    if (trainQueue.history.length > 30) trainQueue.history.length = 30;
+}
+function isAnyTrainingRunning() {
+    for (const [, job] of runningJobs) {
+        if (job.type === 'training') return true;
+    }
+    return false;
+}
+function scheduleQueue(delayMs) {
+    if (queueTimer) clearTimeout(queueTimer);
+    queueTimer = setTimeout(() => { queueTimer = null; processQueue(); }, delayMs);
+}
+async function processQueue() {
+    if (!trainQueue.active || trainQueue.current) return;
+    if (isAnyTrainingRunning()) return;          // something started by hand: wait for it
+    while (trainQueue.items.length) {
+        const next = trainQueue.items.shift();
+        if (!fs.existsSync(path.join(getJobPath(next), 'config.toml'))) {
+            queueLog(`skipped "${next}": job not found`);
+            continue;
+        }
+        trainQueue.current = next;
+        saveQueue();
+        const r = await startTrainingJob(next);
+        if (r.status === 200) {
+            queueLog(`started "${next}"`);
+            saveQueue();
+            return;
+        }
+        trainQueue.current = null;
+        trainQueue.lastError = `"${next}": ${r.body && r.body.error}`;
+        queueLog(`failed to start ${trainQueue.lastError}`);
+        if (trainQueue.stopOnError) {
+            trainQueue.active = false;
+            saveQueue();
+            return;
+        }
+    }
+    if (trainQueue.active) queueLog('queue finished');
+    trainQueue.active = false;
+    saveQueue();
+}
+function markQueueUserStop(jobName) {
+    if (trainQueue.current === jobName) queueUserStopped.add(jobName);
+}
+function onQueueJobFinished(jobName, code) {
+    if (trainQueue.current !== jobName) {
+        // A job started by hand finished: the queue may have been waiting for it.
+        if (trainQueue.active) scheduleQueue(5000);
+        return;
+    }
+    trainQueue.current = null;
+    if (queueUserStopped.has(jobName)) {
+        queueUserStopped.delete(jobName);
+        trainQueue.active = false;
+        queueLog(`"${jobName}" stopped by user, queue paused`);
+    } else if (code !== 0) {
+        trainQueue.lastError = `"${jobName}" exited with code ${code}`;
+        queueLog(`${trainQueue.lastError}`);
+        if (trainQueue.stopOnError) {
+            trainQueue.active = false;
+            queueLog('queue paused (stop on error)');
+        }
+    } else {
+        queueLog(`finished "${jobName}"`);
+    }
+    saveQueue();
+    // Give the GPU a few seconds to release memory before the next run.
+    if (trainQueue.active) scheduleQueue(8000);
+}
+function queueState() {
+    return Object.assign({}, trainQueue, { trainingRunning: isAnyTrainingRunning() });
+}
+
+app.get('/api/queue', (req, res) => res.json(queueState()));
+app.post('/api/queue/add', (req, res) => {
+    const name = sanitizeName(String((req.body && req.body.name) || ''));
+    if (!fs.existsSync(path.join(getJobPath(name), 'config.toml'))) return res.status(404).json({ error: 'Job not found' });
+    if (trainQueue.items.includes(name) || trainQueue.current === name) return res.status(400).json({ error: 'Job is already in the queue' });
+    trainQueue.items.push(name);
+    saveQueue();
+    res.json(queueState());
+});
+app.post('/api/queue/remove', (req, res) => {
+    const name = sanitizeName(String((req.body && req.body.name) || ''));
+    trainQueue.items = trainQueue.items.filter(n => n !== name);
+    saveQueue();
+    res.json(queueState());
+});
+app.post('/api/queue/move', (req, res) => {
+    const name = sanitizeName(String((req.body && req.body.name) || ''));
+    const dir = Number(req.body && req.body.dir) < 0 ? -1 : 1;
+    const i = trainQueue.items.indexOf(name), j = i + dir;
+    if (i >= 0 && j >= 0 && j < trainQueue.items.length) {
+        [trainQueue.items[i], trainQueue.items[j]] = [trainQueue.items[j], trainQueue.items[i]];
+        saveQueue();
+    }
+    res.json(queueState());
+});
+app.post('/api/queue/clear', (req, res) => {
+    trainQueue.items = [];
+    saveQueue();
+    res.json(queueState());
+});
+app.post('/api/queue/start', async (req, res) => {
+    trainQueue.active = true;
+    trainQueue.lastError = '';
+    queueLog(isAnyTrainingRunning() ? 'queue armed, waiting for the current training' : 'queue started');
+    saveQueue();
+    await processQueue();
+    res.json(queueState());
+});
+app.post('/api/queue/pause', (req, res) => {
+    trainQueue.active = false;
+    queueLog('queue paused (current training keeps running)');
+    saveQueue();
+    res.json(queueState());
+});
+app.post('/api/queue/options', (req, res) => {
+    if (req.body && typeof req.body.stopOnError === 'boolean') trainQueue.stopOnError = req.body.stopOnError;
+    saveQueue();
+    res.json(queueState());
+});
+loadQueue();
+
+async function startTrainingJob(rawName) {
+    try {
+        const jobName = sanitizeName(rawName);
         const jobPath = getJobPath(jobName);
         const configPath = path.join(jobPath, 'config.toml');
 
         if (!fs.existsSync(configPath)) {
-            return res.status(404).json({ error: 'Job not found' });
+            return { status: 404, body: { error: 'Job not found' } };
         }
         if (runningJobs.has(jobName)) {
-            return res.status(400).json({ error: 'Job already running' });
+            return { status: 400, body: { error: 'Job already running' } };
         }
 
         // Auto-kill persistent gen server to free VRAM
@@ -1709,7 +1868,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         }
 
         const launch = buildLaunchConfig(currentGpuIds, mergedConfig, mergedConfigPath, jobArch);
-        if (launch.error) return res.status(400).json({ error: launch.error });
+        if (launch.error) return { status: 400, body: { error: launch.error } };
         const { gpuEnv, accelerateFlags, tpTrainCmd } = launch;
 
         const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
@@ -1717,10 +1876,10 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
 
         if (mergedConfig.training_arguments?.use_muon) {
             if (hasNetwork) {
-                return res.status(400).json({ error: 'Muon optimizer is only supported for full finetuning, not for LoRA training.' });
+                return { status: 400, body: { error: 'Muon optimizer is only supported for full finetuning, not for LoRA training.' } };
             }
             if (resolvedMode === 'deepspeed') {
-                return res.status(400).json({ error: 'Muon is incompatible with DeepSpeed.' });
+                return { status: 400, body: { error: 'Muon is incompatible with DeepSpeed.' } };
             }
         }
 
@@ -1789,12 +1948,14 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             appendLog(Buffer.from(msg));
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
+            onQueueJobFinished(jobName, code);
         });
 
         proc.on('error', (err) => {
             appendLog(Buffer.from(`\nERROR: ${err.message}\n`));
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
+            onQueueJobFinished(jobName, -1);
         });
 
         runningJobs.set(jobName, {
@@ -1807,10 +1968,15 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         });
 
         broadcastStatus(jobName, 'running');
-        res.json({ success: true, pid: proc.pid });
+        return { status: 200, body: { success: true, pid: proc.pid } };
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return { status: 500, body: { error: err.message } };
     }
+}
+
+app.post('/api/jobs/:name/train/start', async (req, res) => {
+    const r = await startTrainingJob(req.params.name);
+    res.status(r.status).json(r.body);
 });
 
 

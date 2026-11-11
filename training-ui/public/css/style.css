@@ -1691,3 +1691,72 @@ input:disabled, select:disabled {
     filter: grayscale(0.8);
     transition: opacity 0.2s ease;
 }
+/* === Training Queue (AniDream patch) === */
+.queue-panel {
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+    font-size: 0.85rem;
+}
+.queue-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+.queue-title { font-weight: 600; }
+.queue-count {
+    display: inline-block;
+    min-width: 18px;
+    padding: 0 6px;
+    border-radius: 9px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    text-align: center;
+    font-size: 0.75rem;
+}
+.queue-state { color: var(--text-muted); font-size: 0.75rem; }
+.queue-state.active { color: var(--success); }
+.queue-current {
+    padding: 4px 8px;
+    margin-bottom: 4px;
+    border-left: 3px solid var(--success);
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.queue-list {
+    list-style: decimal inside;
+    margin: 0 0 6px;
+    padding: 0;
+    max-height: 160px;
+    overflow-y: auto;
+}
+.queue-list li {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+.queue-list li:hover { background: var(--bg-tertiary); }
+.queue-list .q-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.queue-list .q-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 0 4px;
+    font-size: 0.8rem;
+}
+.queue-list .q-btn:hover { color: var(--text-primary); }
+.queue-empty { color: var(--text-muted); font-style: italic; list-style: none; }
+.queue-controls { display: flex; gap: 6px; margin-bottom: 6px; }
+.queue-option { display: flex; align-items: center; gap: 6px; color: var(--text-secondary); cursor: pointer; }
+.queue-error { margin-top: 6px; color: var(--danger); font-size: 0.75rem; word-break: break-word; }

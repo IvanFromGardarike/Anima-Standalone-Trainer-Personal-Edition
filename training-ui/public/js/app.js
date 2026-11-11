@@ -266,6 +266,7 @@ async function selectJob(name) {
   if (isDirty && !confirm("Unsaved changes. Switch anyway?")) return;
   isDirty = false;
   currentJob = name;
+  if (queueData) renderQueue(queueData);
   if (samplesPollTimer) {
     clearInterval(samplesPollTimer);
     samplesPollTimer = null;
@@ -4082,3 +4083,94 @@ $("ad-fill").addEventListener("click", adFill);
   const p = adEff();
   if (p) { $("ad-epochs").value = p.epochs; adCalc(); }
 }));
+
+// ==========================================
+//  Training Queue (AniDream patch)
+// ==========================================
+let queueData = null;
+function escQ(t) {
+  return String(t).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+function renderQueue(q) {
+  if (!q || !$("queue-panel")) return;
+  queueData = q;
+  $("queue-count").textContent = q.items.length;
+  const st = $("queue-state");
+  st.textContent = q.active ? (q.current ? "running" : (q.trainingRunning ? "waiting" : "active")) : "idle";
+  st.classList.toggle("active", !!q.active);
+  const cur = $("queue-current");
+  if (q.current) {
+    cur.textContent = "▶ " + q.current;
+    cur.title = q.current;
+    cur.classList.remove("hidden");
+  } else {
+    cur.classList.add("hidden");
+  }
+  const list = $("queue-list");
+  if (!q.items.length) {
+    list.innerHTML = '<li class="queue-empty">empty</li>';
+  } else {
+    list.innerHTML = q.items
+      .map(
+        (n, i) => `<li data-name="${escQ(n)}"><span class="q-name" title="${escQ(n)}">${escQ(n)}</span>` +
+          `<button class="q-btn" data-act="up" title="Move up" ${i === 0 ? "disabled" : ""}>▲</button>` +
+          `<button class="q-btn" data-act="down" title="Move down" ${i === q.items.length - 1 ? "disabled" : ""}>▼</button>` +
+          `<button class="q-btn" data-act="remove" title="Remove">✕</button></li>`,
+      )
+      .join("");
+  }
+  $("btn-queue-start").classList.toggle("hidden", !!q.active);
+  $("btn-queue-pause").classList.toggle("hidden", !q.active);
+  $("chk-queue-stop-on-error").checked = !!q.stopOnError;
+  const err = $("queue-error");
+  if (q.lastError) {
+    err.textContent = "Last error: " + q.lastError;
+    err.classList.remove("hidden");
+  } else {
+    err.classList.add("hidden");
+  }
+  const addBtn = $("btn-queue-add");
+  if (addBtn && currentJob) {
+    const inQ = q.items.includes(currentJob) || q.current === currentJob;
+    addBtn.disabled = inQ;
+    addBtn.textContent = inQ ? "✓ Queued" : "＋ Queue";
+  }
+}
+async function queueCall(url, body) {
+  try {
+    const q = await api(url, { method: body === undefined ? "GET" : "POST", body });
+    renderQueue(q);
+    if (typeof loadJobs === "function" && body !== undefined) loadJobs();
+    return q;
+  } catch (e) {
+    showToast(e.message);
+  }
+}
+if ($("queue-panel")) {
+  $("btn-queue-add").addEventListener("click", async () => {
+    if (!currentJob) return;
+    if (isDirty) await saveJob();
+    const q = await queueCall("/api/queue/add", { name: currentJob });
+    if (q) showToast(`"${currentJob}" added to the queue`);
+  });
+  $("btn-queue-start").addEventListener("click", () => queueCall("/api/queue/start", {}));
+  $("btn-queue-pause").addEventListener("click", () => queueCall("/api/queue/pause", {}));
+  $("btn-queue-clear").addEventListener("click", () => {
+    if (!queueData || !queueData.items.length) return;
+    if (confirm("Remove all waiting jobs from the queue?")) queueCall("/api/queue/clear", {});
+  });
+  $("chk-queue-stop-on-error").addEventListener("change", (e) =>
+    queueCall("/api/queue/options", { stopOnError: e.target.checked }),
+  );
+  $("queue-list").addEventListener("click", (e) => {
+    const btn = e.target.closest(".q-btn");
+    if (!btn || btn.disabled) return;
+    const name = btn.closest("li").dataset.name;
+    const act = btn.dataset.act;
+    if (act === "remove") queueCall("/api/queue/remove", { name });
+    else queueCall("/api/queue/move", { name, dir: act === "up" ? -1 : 1 });
+  });
+  const pollQueue = () => queueCall("/api/queue");
+  pollQueue();
+  setInterval(pollQueue, 4000);
+}

@@ -51,3 +51,4 @@ training-ui/_merged_config.toml
 # OS
 .DS_Store
 Thumbs.db
+training-ui/queue.json
