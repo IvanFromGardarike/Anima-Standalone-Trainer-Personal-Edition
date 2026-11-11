@@ -59,17 +59,17 @@
 - «Fill in steps» переключает на Steps и вписывает Max Steps / Save Every / Sample Every. Дальше обычный Save.
 - Работает без интернета: всё внутри интерфейса, подсчёт картинок — новый запрос сервера `/api/count-images` (после обновления перезапустить интерфейс).
 
-## 8. Training queue
+## 8. Очередь обучения (боковая панель Jobs, внизу)
 
-A queue panel at the bottom of the Jobs sidebar runs trainings one after another, e.g. several LoRAs overnight.
+Запускает обучения одно за другим, например несколько LoRA на ночь.
 
-- **＋ Queue** (next to ▶ Train) adds the open job to the queue. Unsaved changes are saved first.
-- **▶ Start** starts the queue. If a training is already running (started by hand), the queue waits for it and then continues.
-- **⏸ Pause** stops the queue from starting further jobs; the current training keeps running.
-- ▲ ▼ change the order, ✕ removes a job, **Clear** removes all waiting jobs.
-- When a training ends, the next job starts after ~8 seconds so the GPU can release memory.
-- **Stop on error**: if a job fails (non-zero exit), pause the queue instead of moving on.
-- Pressing ⏹ Stop on the job the queue started pauses the queue (it does not jump to the next job).
-- The queue is saved to `training-ui/queue.json` and survives a restart of the UI, but it never resumes by itself after a restart: press ▶ Start again.
+- **＋ Queue** (рядом с ▶ Train) добавляет открытую задачу в очередь. Несохранённые изменения сначала сохраняются.
+- **▶ Start** запускает очередь. Если обучение уже идёт (запущено вручную), очередь дождётся его конца и продолжит.
+- **⏸ Pause** — больше не запускать новые задачи; текущее обучение продолжается.
+- ▲ ▼ меняют порядок, ✕ убирает задачу, **Clear** убирает все ожидающие.
+- Когда обучение заканчивается, следующее стартует примерно через 8 секунд, чтобы видеокарта успела освободить память.
+- **Stop on error**: если задача упала (код выхода не 0), очередь встаёт на паузу, а не идёт дальше.
+- ⏹ Stop на задаче, которую запустила очередь, ставит очередь на паузу (к следующей задаче она не переходит).
+- Очередь хранится в `training-ui/queue.json` и переживает перезапуск интерфейса, но сама после перезапуска не стартует: нужно снова нажать ▶ Start.
 
-Server API: `GET /api/queue`, `POST /api/queue/{add,remove,move,clear,start,pause,options}`. The training start logic was moved into `startTrainingJob()` so the route and the queue share it; the route behaves exactly as before.
+API сервера: `GET /api/queue`, `POST /api/queue/{add,remove,move,clear,start,pause,options}`. Логика запуска обучения вынесена в `startTrainingJob()`, ей пользуются и кнопка Train, и очередь; кнопка работает как раньше.
